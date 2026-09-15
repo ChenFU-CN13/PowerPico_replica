@@ -1,0 +1,63 @@
+# 压缩包、临时备份
+*.zip
+*.rar
+*.7z
+*_backup/
+*_bak/
+
+# ESP-IDF 编译输出
+ESP32S3-OTA/build/
+ESP32S3-OTA/sdkconfig.old
+
+# Keil / MDK 编译输出
+**/Objects/
+**/Listings/
+**/DebugConfig/
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.d
+*.dep
+*.crf
+*.lnp
+*.build_log.htm
+*.htm
+# Keil 额外生成文件
+*.lst
+*.Bak
+*.bak
+*.iex
+
+
+# Keil 本机用户配置（.uvprojx 是工程文件需保留，.uvoptx 是本机选项不提交）
+*.uvoptx
+*.uvguix.*
+*.uvoptx.tmp
+
+
+**/.eide/
+
+
+# WorkBuddy / AI 助手工作目录（本地记忆，不入库）
+.workbuddy/
+.codex/
+
+# IDE、本机临时配置
+.vscode/
+.idea/
+.agents/
+.DS_Store
+Thumbs.db
+
+# 密钥和本地环境配置
+.env
+.env.*
+secrets.h
+credentials.h
+
+# AI 对话记录 / 临时笔记
+AIchat.txt
+
