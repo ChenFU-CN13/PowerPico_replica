@@ -1,0 +1,103 @@
+目前已发现BUG:
+1.在进入设置页面后，我选择PD诱骗选项后，在我没有插入PD适配器，然后页面是正常返回
+警告，然后此时，我再次按下页面切换按钮，就回回到电流电压显示首页，但是运行一两秒后就会卡死（整个卡死页面，按下按钮蜂鸣器还可以响，但是页面测试显示的数据会不动了，然后也无法再次跳转到设置页面，上位机也无法得到数据），需要重新上电才可以正常运行
+
+注意：我是在弹出  PD Setting Failed!  之后没有等待弹窗消失，然后按返回键马上返回的
+
+
+2.VS Code 中用 Keil Assistant 打开工程后，C/C++ 宏、函数或变量无法 Ctrl + 左键跳转
+
+现象：
+    - Keil Assistant 可以正常读取 .uvprojx 工程、调用 Keil 编译，工程也能 0 Error 编译通过；
+    - 但在 VS Code 编辑区，FLAG_CMD_TX_READY 等头文件中的宏没有蓝色下划线，Ctrl + 左键 / F12 无法跳转；
+    - 同一个工程在 Trae IDE 的 Keil Assistant 中可以正常跳转。
+
+结论：
+    Keil 编译成功不等于 VS Code 的代码跳转正常。Keil Assistant 负责工程树和 Keil 编译，
+    Ctrl + 左键跳转依赖 VS Code 的 Microsoft C/C++ 扩展（IntelliSense）提供语义索引。
+    本次根因是 VS Code 的用户设置把 IntelliSense 引擎手动关闭了：
+        "C_Cpp.intelliSenseEngine": "disabled"
+
+以后按下面顺序排查：
+    1. 右键变量/函数，确认菜单中是否有“转到定义（Go to Definition）”。
+       没有该菜单，优先怀疑 C/C++ 语言服务未启动，不要先怀疑 Keil 编译或源码本身。
+    2. 打开 VS Code 设置 JSON，搜索 C_Cpp.intelliSenseEngine。
+       若值为 disabled，改为 default；也可删除该项，使用扩展默认配置。
+    3. 确认 Microsoft C/C++ 扩展（ms-vscode.cpptools）已安装且对当前工作区启用。
+    4. 执行“C/C++: Reset IntelliSense Database”，再执行“Developer: Reload Window”。
+    5. 若仅外部头文件的符号不能跳转，再检查 .vscode/c_cpp_properties.json：
+       includePath 必须包含对应头文件目录；必要时在 browse.path 加入整个工程源码根目录。
+
+本工程对应配置要点：
+    - FLAG_CMD_TX_READY 定义：User/Tasks/Inc/user_TasksInit.h
+    - 使用位置：User/Tasks/Src/user_MessageTask.c
+    - VS Code 工作区配置：MDK-ARM/.vscode/c_cpp_properties.json
+
+
+============================================================
+PowerPico 复刻进度记录（2026-09-12）
+============================================================
+
+一、已确认完成（硬件实测）
+
+1. App 基础运行
+    - 自建 App 保持在 0x08010000，未覆盖 0x08000000 的源 Bootloader。
+    - LED 翻转任务可正常运行。
+
+2. USB CDC 最小验证
+    - Windows 可稳定识别 App 的 USB CDC 虚拟串口。
+    - 反复插拔 USB 后，COM 口可正常出现/消失；LED 功能不受影响。
+
+3. EEPROM（BL24C02）最小验证
+    - I2C1（PB6=SCL、PB7=SDA）通信已验证可用。
+    - 已在 Keil 断点中读取 EEPROM 地址 0x20 的 8 字节标志。
+    - 读取结果为 2D 6E 6F 70 65 2D 0D 0A，即字符串 "-nope-\r\n"。
+
+4. App 软件请求进入 Bootloader
+    - App 已实现接收 USB CDC 文本命令 "BOOT\r\n"。
+    - 收到命令后，App 向 EEPROM 0x20 写入 "update\r\n"，延时、释放 USB CDC，再执行系统复位。
+    - 实测 LCD 已显示 "Bootload"，说明已进入源 Bootloader 的 Bootloader_Main() 路径。
+    - App 侧关键文件：
+        * User/user_CmdStrategy.c
+        * BSP/EEPROM/BL24C02.c
+        * USB_DEVICE/App/usbd_cdc_if.c
+        * USB_DEVICE/App/usb_device.c
+
+二、已确认的架构结论（源代码核对）
+
+1. Flash 分区不是 A/B 双分区，而是“Bootloader + 单 App”：
+    - Bootloader：0x08000000 ~ 0x0800BFFF（48 KB）
+    - 升级信息 Sector3：0x0800C000
+    - App 起始地址：0x08010000
+
+2. Bootloader 启动时，物理 Boot 按键按下或 EEPROM 升级标志有效，均会进入升级模式。
+3. Bootloader 在升级模式下周期发送 "##PICO_BOOT##\r\n"，等待上位机发字符 '0' 后进入升级菜单。
+4. 不应为方便 Keil 下载而将 App 改到 0x08000000；这样会覆盖 Bootloader，失去既有的 USB 恢复升级通道。
+
+三、当前阻塞点（未解决）
+
+1. 在 LCD 显示 "Bootload" 后，PowerPico Client 打开 COM9 失败：
+    - 报错包含 PermissionError(13)；Windows 提示“连接到系统上的设备没有发挥作用”。
+    - 已尝试完全关闭串口助手后复现，尚未证明是端口占用还是 Windows USB 串口驱动状态异常。
+
+2. 当前证据表明：
+    - App -> EEPROM 标志 -> 复位 -> Bootloader 的 MCU 侧切换已成功；
+    - 故障发生在 PC 打开 COM9 或后续 Client 通讯阶段；
+    - 暂不执行全片擦除，避免在未定位 PC 端问题前清除可用的 Bootloader/App 证据。
+
+四、下一步验证顺序
+
+1. 保持 LCD 显示 "Bootload"，先完全退出 PowerPico Client。
+2. 只打开串口助手并打开 COM9，观察是否每约 500 ms 收到 "##PICO_BOOT##"。
+3. 结果判断：
+    - 能收到握手串：Bootloader USB 正常，继续排查 PowerPico Client 或 Windows 对 COM9 的占用/端口状态。
+    - 串口助手也无法打开 COM9：优先在设备管理器中对“USB 串行设备(COM9)”执行禁用/启用并重新插拔 USB，再测试。
+    - 串口助手能打开但没有握手串：重新按物理 Boot 键进入 Bootloader 后复测；必要时再考虑 SWD 恢复源 Bootloader。
+
+五、恢复边界（仅在上述验证确认 Bootloader USB 本身异常后执行）
+
+1. 先用 STM32CubeProgrammer 读取并备份内部 Flash。
+2. 再执行全片擦除、SWD 烧录已验证的源 Bootloader。
+3. 通过 Bootloader/YMODEM 恢复 App，不能仅把 App bin 直接写入后就认为升级信息有效。
+
+
