@@ -22,7 +22,7 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
-#include "user_CmdStrategy.h"
+#include "user_MessageTask.h"
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -155,6 +155,12 @@ static int8_t CDC_Init_FS(void)
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
+
+  /*
+   * 初次枚举或重新枚举已经建立了新的CDC会话。
+   * 释放发送任务中可能由旧会话遗留的发送中状态。
+   */
+  MessageSend_NotifyTxCompleteFromISR();
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -166,6 +172,11 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  /*
+   * USB复位或掉线时可能收不到原发送帧的完成回调。
+   * 此处唤醒发送任务，避免usb_tx_active永久保持true。
+   */
+  MessageSend_NotifyTxCompleteFromISR();
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -261,10 +272,18 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  /*
+   * STEP6E：USB回调只复制并投递数据，不在中断中执行命令解析。
+   * 入队失败会在MessageReceiveTask的调试计数中记录，
+   * 但无论成功还是失败，都必须重新使能下一包USB接收。
+   */
+  if (Len != NULL)
+  {
+    (void)MessageReceive_EnqueueFromISR(Buf, *Len);
+  }
 
-   CmdStrategy_ProcessRx(Buf, (uint16_t)(*Len));
-
-  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
+  /* 下次接收继续使用CubeMX分配的USB CDC接收缓冲区。 */
+  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
   /* USER CODE END 6 */
@@ -285,7 +304,22 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
   uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
-  USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
+  USBD_CDC_HandleTypeDef *hcdc;
+
+  if (Buf == NULL || Len == 0U)
+  {
+    return USBD_FAIL;
+  }
+  /*
+   * USB尚未完成枚举，或者已经被卸载时，
+   * pClassData可能为空，不能直接读取TxState。
+   */
+  hcdc = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+  if (hcdc == NULL)
+  {
+    return USBD_FAIL;
+  }
+
   if (hcdc->TxState != 0){
     return USBD_BUSY;
   }
@@ -314,6 +348,12 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+
+    /*
+   * USB库已经完成上一帧发送，并清除了内部TxState。
+   *这里只通知发送任务，下一帧由任务决定什么时候发送。
+   */
+  MessageSend_NotifyTxCompleteFromISR();
   /* USER CODE END 13 */
   return result;
 }

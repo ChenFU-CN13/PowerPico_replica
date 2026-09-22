@@ -54,18 +54,16 @@ void USER_USB_DEVICE_DeInit(void)
    * 重新枚举。这里还要复位 OTG_FS 内核，并将 D+ 拉低模拟物理拔线。
    */
 
-  
-  
-  
-   
-  (void)USBD_Stop(&hUsbDeviceFS);
-  (void)USBD_DeInit(&hUsbDeviceFS);
-  __HAL_RCC_USB_OTG_FS_FORCE_RESET();
-  HAL_Delay(10U);
-  __HAL_RCC_USB_OTG_FS_RELEASE_RESET();
-  __HAL_RCC_USB_OTG_FS_CLK_DISABLE();
-  HAL_PCD_MspDeInit(hUsbDeviceFS.pData);
-  USER_USBD_LL_Simulate_Disconnect();
+  (void)USBD_Stop(&hUsbDeviceFS);     //设备和电脑停止USB通讯，虚拟串口会消失
+  (void)USBD_DeInit(&hUsbDeviceFS);   //卸载USB外设相关配置
+
+  __HAL_RCC_USB_OTG_FS_FORCE_RESET(); //OTG_FS外设自我复位，用于清除内部寄存器配置和相关硬件状态
+  HAL_Delay(10U);                     //等待完全复位
+  __HAL_RCC_USB_OTG_FS_RELEASE_RESET();//解除OTG_FS外设自我复位
+
+  __HAL_RCC_USB_OTG_FS_CLK_DISABLE();   //关闭OTG_FS外设的时钟
+  HAL_PCD_MspDeInit(hUsbDeviceFS.pData);//再次卸载USB配置
+  USER_USBD_LL_Simulate_Disconnect();   //把 D+ 拉低：模拟物理拔出 USB，让电脑以为外部真的拔出来了
 }
 /* USER CODE END 0 */
 
