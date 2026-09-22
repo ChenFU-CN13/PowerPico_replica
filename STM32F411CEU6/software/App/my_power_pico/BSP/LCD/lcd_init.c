@@ -15,7 +15,7 @@ void LCD_GPIO_Init(void)
 {
 	GPIO_InitTypeDef  GPIO_InitStructure = {0};
 
-	__HAL_RCC_GPIOB_CLK_ENABLE();
+	__HAL_RCC_GPIOA_CLK_ENABLE();
 	__HAL_RCC_GPIOB_CLK_ENABLE();
 
 	GPIO_InitStructure.Pin = RES_PIN;

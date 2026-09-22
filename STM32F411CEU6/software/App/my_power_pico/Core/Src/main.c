@@ -19,12 +19,17 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "adc.h"
+#include "dma.h"
 #include "i2c.h"
+#include "spi.h"
+#include "tim.h"
 #include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "gate.h"
 
 /* USER CODE END Includes */
 
@@ -87,15 +92,32 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  /*
+   * 外设和RTOS启动前先把采样流路固定到HIGH档。
+   * 未知负载上电时优先使用最小采样电阻，降低误入LOW档的风险。
+   */
+  Gate_Port_Init();
+  flow_route_selection(HIGH_CUR);
+
   // 明确打开总中断。后续 DMA、定时器和 RTOS 调度都依赖中断工作。
   __enable_irq();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
+  MX_SPI2_Init();
+  MX_TIM1_Init();
+  MX_TIM5_Init();
+  MX_ADC1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-
+  if (HAL_TIM_Base_Start(&htim5)!=HAL_OK)
+  {
+    Error_Handler();
+  }
+  ClearMicrosecondCounter();//上电先清除微秒计数器
   /* USER CODE END 2 */
 
   /* Init scheduler */

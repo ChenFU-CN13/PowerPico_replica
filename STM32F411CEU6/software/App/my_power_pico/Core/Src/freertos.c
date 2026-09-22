@@ -25,13 +25,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "BL24C02.h"
+#include "user_TasksInit.h"
 #include "user_CmdStrategy.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -52,12 +51,13 @@
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
+
 
 /* USER CODE END FunctionPrototypes */
 
@@ -97,7 +97,8 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  /* ADC处理优先级高于LCD任务，避免LCD整屏刷新拖慢自动换挡。 */
+  User_Tasks_Init();
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -117,28 +118,30 @@ void StartDefaultTask(void *argument)
 {
   /* init code for USB_DEVICE */
   MX_USB_DEVICE_Init();
-  CmdStrategy_Init();
   /* USER CODE BEGIN StartDefaultTask */
-  
-  static uint8_t eeprom_update_flag[8];
-  static volatile bool eeprom_read_ok;
+  (void)argument;
 
-  /*目前只读不写，用于确认设备通讯正常*/
-  eeprom_read_ok = EEPROM_ReadBytes(0X20,eeprom_update_flag,sizeof(eeprom_update_flag));
-
+  /*
+   * STEP6D以后，LCD由LvHandlerTask独占。
+   * STEP6E以后，USB字节解析由MessageReceiveTask负责。
+   * defaultTask只保留命令处理和心跳灯。
+   */
 
   /* Infinite loop */
   for(;;)
   {
     CmdStrategy_Process();
-	  HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_13);
-    osDelay(500);
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+
+    /* 低速后台任务周期。 */
+    osDelay(200U);
   }
   /* USER CODE END StartDefaultTask */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
 
 /* USER CODE END Application */
 
