@@ -45,14 +45,7 @@ static void Step6B_WaitForMigration(void)
 }
 
 
-/**
- * @brief 按键任务骨架
- */
-void KeyTask(void *argument)
-{
-    (void)argument;
-    Step6B_WaitForMigration();
-}
+
 
 /**
  * @brief PD协议任务骨架

@@ -84,9 +84,9 @@ void flow_route_selection(uint8_t selection)
 
 
 /*
- * @brief  获取门的当前状态
+ * @brief  获取门的当前实际的工作模式状态
  * @param None
- * @retval 门的当前状态，LOW_CUR、MID_CUR、HIGH_CUR
+ * @retval 门的当前实际的工作模式状态，LOW_CUR、MID_CUR、HIGH_CUR
  */
 uint8_t Gate_get_status(void)
 {
@@ -94,9 +94,13 @@ uint8_t Gate_get_status(void)
 }
 
 
+
+
+
 /*
- * @brief  设置门的范围模式
- * @param mode: 选择的范围模式，GATE_MODE_AUTO、GATE_MODE_LOW、GATE_MODE_MID、GATE_MODE_HIGH
+ * @brief  设置门的工作模式
+ * @param mode: 用户选择的工作模式，GATE_MODE_AUTO、
+ * GATE_MODE_LOW、GATE_MODE_MID、GATE_MODE_HIGH
  * @retval None
  */
 void Gate_Set_Mode(uint8_t mode)
@@ -114,6 +118,11 @@ void Gate_Set_Mode(uint8_t mode)
 
     
 }
+
+
+
+
+
 
 /*
  * @brief  获取门的当前范围模式

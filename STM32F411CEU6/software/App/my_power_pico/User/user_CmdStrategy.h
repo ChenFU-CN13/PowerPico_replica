@@ -9,7 +9,7 @@ extern "C" {
 
 #define CMD_PROTOCOL_VERSION     1U     // 当前命令协议版本；请求帧版本不等于它时，板子拒绝执行。
 
-/* 上位机请求命令号；板子回复时会把命令号按位或 0x80，例如 0x11 回复为 0x91。 */
+/* 上位机请求命令号；板子回复时会把命令号按位或 上 0x80 ，例如 0x11 回复为 0x91。 */
 #define CMD_CAL_GET              0x10U  // 查询当前三档 ADC 校准参数。
 #define CMD_RANGE_GET            0x11U  // 查询量程模式和当前实际硬件档位。
 #define CMD_RANGE_SET            0x12U  // 设置量程模式：AUTO、LOW、MID 或 HIGH。

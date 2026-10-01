@@ -366,10 +366,36 @@ HIGH = 0.005Ω
 
 
 
+六PD协议，PPS协议时序交换数据大概流程图如下
 
 
-
-
+Sink (PowerPico)                          Source (充电器)
+     |                                        				  |
+     |<---- VBUS 5V 上电 -----------------------|
+     |                                        				  |
+     |  CC检测，发现 BC_LVL > 1                 	 |
+     |  wait_src_cap = 1                     		   |
+     |                                      				    |
+     |<---- Source_Capabilities (5V,9V,12V,20V,PPS) |
+     |                                         				 |
+     |  解析能力表，选 9V PDO                   	 |
+     |                                    				      |
+     |---- Request (9V/3A, Object Position=2) ->|
+     |                                         					 |
+     |<---- GoodCRC (FUSB302 自动回) -----------|
+     |                                       					   |
+     |<---- Accept -----------------------------|
+     |                                       					   |
+     |  VBUS 开始升压                    				        |
+     |                                       					   |
+     |<---- PS_RDY -----------------------------|
+     |                                      					    |
+     |  state = SUCCESS_FIXED, VBUS=9V          |
+     |                                     					     |
+     |  (PPS 模式) 每 5 秒重发 Request 保活       |
+     |---- Request (PPS 9V/2A) ---------------->|
+     |<---- PS_RDY -----------------------------|
+     |                                     					     |
 
 
 

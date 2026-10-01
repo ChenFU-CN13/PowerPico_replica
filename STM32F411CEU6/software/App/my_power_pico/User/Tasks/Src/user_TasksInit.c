@@ -117,19 +117,24 @@ static const osThreadAttr_t KeyTask_attributes =
     .priority = osPriorityBelowNormal
 };
 
-/* 后续用于PD协议，本轮不访问FUSB302。 */
+/*
+ * STEP9修复说明（相对当前复刻工程原配置）：
+ * PD任务比LVGL高一个CMSIS优先级，恢复官方工程“PD略高于界面”的相对关系，
+ * 减少LCD刷新抢占10 ms阻塞式I2C事务的机会。实板结果支持该调整有效，
+ * 但本轮未做单变量A/B，因此不把任务优先级单独认定为唯一根因。
+ */
 static const osThreadAttr_t PDUFPTask_attributes =
 {
     .name = "PDUFPTask",
-    .stack_size = 512U,
-    .priority = osPriorityLow
+    .stack_size = 128*16,
+    .priority = osPriorityBelowNormal1
 };
 
 /* STEP6D中唯一允许访问LCD的任务。 */
 static const osThreadAttr_t LvHandlerTask_attributes =
 {
     .name = "LvHandlerTask",
-    .stack_size = 1024U,
+    .stack_size = 128U * 48U,
     .priority = osPriorityBelowNormal
 };
 
@@ -163,10 +168,10 @@ void User_Tasks_Init(void)
     Key_MessageQueue = osMessageQueueNew(4,sizeof(key_event_t),NULL);
 
     PD_cmd_MessageQueue =
-        osMessageQueueNew(4U, sizeof(PDCommandMsg_T), NULL);
+        osMessageQueueNew(4U, sizeof(PD_command_msg_t), NULL);
 
     PD_handle_event_MsgQueue =
-        osMessageQueueNew(4U, sizeof(uint8_t), NULL);
+        osMessageQueueNew(4U, sizeof(PD_handle_event_t), NULL);
 
     PowerDataQueue =
         osMessageQueueNew(8U, sizeof(PowerData_T), NULL);
@@ -218,10 +223,8 @@ void User_Tasks_Init(void)
 
   /*
    * 创建任务。
-   *
    * STEP6D开始由LvHandlerTask独占LCD。
    * defaultTask不再直接调用LCD绘图函数。
-   *
    * 本轮也没有保留adcProcessTask：
    * 原ADC任务直接改名为MessageSendTask。
    */
@@ -288,6 +291,8 @@ void User_Tasks_MarkHardwareInitDone(void)
 {
     s_hardware_init_done = true;
 }
+
+
 
 /**
  * @brief 获取任务框架当前状态

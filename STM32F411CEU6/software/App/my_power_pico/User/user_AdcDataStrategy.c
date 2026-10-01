@@ -41,10 +41,10 @@ static bool s_usb_packet_valid;
  */
 typedef struct
 {
-    uint32_t sequence;
-    uint8_t sample_range;
-    uint8_t reserved;
-    uint16_t samples[ADC_TIMES][ADC_CHANNELS];
+    uint32_t sequence;          //数据序号
+    uint8_t sample_range;       //当前真实档位
+    uint8_t reserved;           //保留位
+    uint16_t samples[ADC_TIMES][ADC_CHANNELS]; //10组五通道ADC数据，即1个半区
 } ADC_BlockSlot_T;
 
 static ADC_BlockSlot_T s_adc_block_queue[ADC_BLOCK_QUEUE_DEPTH];
@@ -78,6 +78,28 @@ static volatile uint32_t s_auto_debug_seq;
 volatile uint32_t adc_half_count;
 volatile uint32_t adc_full_count;
 volatile uint32_t adc_error_count;
+
+/**
+ * @brief LCD显示数据统计结构
+ *
+ * 电压使用mV累加。
+ * 电流使用10nA累加，1uA等于100个10nA。
+ */
+typedef struct
+{
+    uint64_t sum_voltage_mv;
+    int64_t sum_current_10na;
+    uint32_t sample_count;
+
+    float average_voltage_v;
+    float average_current_ua;
+
+    uint8_t last_range;
+    bool average_valid;
+} Data_Monitor_T;
+
+static Data_Monitor_T s_data_monitor;
+
 
 
 /***********增加内部辅助函数，仅在本文中使用*************/
@@ -392,6 +414,118 @@ bool ADC_Calibration_IsValid(const ADC_Calibration_T *cfg)
 
 /************************************************************************/
 
+/**
+ * @brief 清空LCD显示统计值
+ */
+static void Data_Monitor_Clear(void)
+{
+    memset(&s_data_monitor, 0, sizeof(s_data_monitor));
+}
+
+/**
+ * @brief 累加一个有效ADC采样点
+ * @param voltage_adc 电压通道ADC原始值
+ * @param current_adc 当前档电流通道ADC原始值
+ * @param ref_adc 1.5V参考通道ADC原始值
+ * @param range 本采样点对应的真实量程
+ */
+static void Data_Monitor_Update(uint16_t voltage_adc,
+                                uint16_t current_adc,
+                                uint16_t ref_adc,
+                                uint8_t range)
+{
+    float voltage_mv;
+    float current_ua;
+    float divider_error_10na;
+    float final_current_10na;
+
+    /*
+     * 将VBUS电压换算成mV。
+     */
+    voltage_mv = (float)voltage_adc
+               * (ADC_VREF_V * 1000.0f / ADC_MAX_CODE)
+               * VBUS_DIVIDER_GAIN;
+
+
+    /*
+     * 每个采样点按照产生它的真实档位进行换算。
+     * 校准倍率和零点偏移会在该函数内生效。
+     */
+    current_ua = ADC_ConvertCurrent_uA(current_adc,ref_adc,range);
+
+
+    /*
+     * 在官方代码中会扣除VBUS分压电阻消耗的少量电流。
+     *例如
+     * voltage_mv / 11得到的单位正好是10nA。
+     * 例如VBUS=5V时，修正量约为4.55uA。
+     */
+    divider_error_10na  = voltage_mv / 11.0f;
+
+    final_current_10na = current_ua * 100.0f - divider_error_10na;
+
+    s_data_monitor.sum_voltage_mv += (uint64_t)voltage_mv;
+
+    /* 电流允许为负值，必须按有符号数累加。 */
+    s_data_monitor.sum_current_10na += (int64_t)final_current_10na;
+
+    s_data_monitor.sample_count++;
+    s_data_monitor.last_range = range;
+
+    /*累加2500次后发布一次新的平均值*/
+    if (s_data_monitor.sample_count >= DATA_MONITOR_SAMPLE_COUNT)
+    {
+        s_data_monitor.average_voltage_v = (float)s_data_monitor.sum_voltage_mv / (float)s_data_monitor.sample_count /1000.0F;
+        s_data_monitor.average_current_ua = (float)s_data_monitor.sum_current_10na / (float)s_data_monitor.sample_count / 100.0F;
+
+        s_data_monitor.sum_voltage_mv = 0;
+        s_data_monitor.sum_current_10na = 0;
+        s_data_monitor.sample_count = 0;
+        s_data_monitor.average_valid = true;
+    }
+
+}
+
+
+/**
+ * @brief 获取LCD使用的平均测量值
+ */
+bool Data_Monitor_GetValues(float *out_voltage_v,
+                            float *out_current_ua,
+                            uint8_t *out_range)
+{
+    if ((out_voltage_v == NULL)
+        || (out_current_ua == NULL)
+        || (out_range == NULL)
+        || !s_data_monitor.average_valid)
+    {
+        return false;
+    }
+    /*
+     * 本函数与更新函数都运行在MessageSendTask中，
+     * 不需要关闭中断。
+     */
+    *out_voltage_v = s_data_monitor.average_voltage_v;
+    *out_current_ua = s_data_monitor.average_current_ua;
+    *out_range = s_data_monitor.last_range;
+
+    return true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /********************************自动切换量程核心代码****************************************/
 /**
@@ -402,39 +536,39 @@ bool ADC_Calibration_IsValid(const ADC_Calibration_T *cfg)
  */
 bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
 {
-    uint8_t gate_mode;
-    uint8_t current_range;
-    uint8_t request_range;
-    uint8_t i;
-    bool decision_enabled;
+    uint8_t gate_mode;           //当前开关模式
+    uint8_t current_range;       //当前档位
+    uint8_t request_range;       //请求档位
+    uint8_t i;                   //循环变量
+    bool decision_enabled;       //是否允许判断换挡
 
-    uint16_t current_adc_raw;
-    uint16_t ref_adc_raw;
-    uint16_t abs_delta_adc_raw;
-    bool mid_near_rail;
-    int32_t delta_adc_raw;
+    uint16_t current_adc_raw;   //当前通道原始ADC值
+    uint16_t ref_adc_raw;       //参考通道原始ADC值
+    uint16_t abs_delta_adc_raw; //绝对差值
+    bool mid_near_rail;         //是否在中档位附近
+    int32_t delta_adc_raw;      //差值
 
     /*1.先保持默认档位，保持默认事件和判空*/
     ADC_SwitchReason_T  switch_reason = ADC_SWITCH_REASON_NONE;
 
     if (chunk_ptr == NULL)
     {
+        /*空指针，直接退出函数*/
         return false;
     }
 
-    ADC_AutoRange_DebugWriteBegin();
+    ADC_AutoRange_DebugWriteBegin();    //开始写入调试数据
 
-    /*保持当前档位*/
+    /*先保持当前档位*/
     gate_mode = Gate_Get_Mode();
     current_range = Gate_get_status();
     request_range = current_range;
-
+    /*未经以下处理的，先保持当前档位，避免后续判断错误*/
     s_auto_debug.current_range = current_range;
     s_auto_debug.request_range = request_range;
 
     /*
      * 刚切档后的下一整块数据不可信。
-     *
      * 原因：
      * MOS开关、采样电阻流路和INA190输出都需要一点稳定时间。
      * 所以这里整块丢弃，不参与换挡判断，也不参与正式数据显示。
@@ -446,9 +580,9 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
         s_auto_debug.state = ADC_RANGE_STATE_SKIP;
         s_auto_debug.skipped_block_count++;
 
-        ADC_AutoRange_UpdateDebugCount();
-        ADC_AutoRange_DebugWriteEnd();
-        return false;
+        ADC_AutoRange_UpdateDebugCount();    //更新调试数据计数
+        ADC_AutoRange_DebugWriteEnd();      //结束写入调试数据
+        return false;                       //返回false，表示本块数据不可信，退出函数
     }
     
 
@@ -474,15 +608,15 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
     decision_enabled  = (gate_mode == GATE_MODE_AUTO) && (s_auto_cooldown_chunks==0);//要满足门状态和冷却计算=0
 
     if (decision_enabled)
-    {
+    {   /*说明当前是自动模式，且冷却结束*/
         s_auto_debug.state = ADC_RANGE_STATE_HOLD;//保持
     }
     else if (s_auto_cooldown_chunks > 0)
-    {
+    {   /*说明当前是自动模式，且冷却中*/
         s_auto_debug.state = ADC_RANGE_STATE_COOL;//冷却
     }
     else
-    {
+    {   /*说明当前是手动模式*/
         s_auto_debug.state = ADC_RANGE_STATE_HOLD;//保持
     }
 
@@ -494,7 +628,7 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
     {
         const uint16_t *sample_row;
 
-        sample_row = chunk_ptr + ((uint32_t)i*ADC_CHANNELS);    //这里是移动下一组5通道ADC数据的意思
+        sample_row = chunk_ptr + ((uint32_t)i*ADC_CHANNELS);                //这里是移动下一组5通道ADC数据的意思
         /*比如：i = 0，chunk_ptr + 0 × 5= chunk_ptr + 0
         当i=1 ，= chunk_ptr + 5
         V0 L0 M0 H0 R0 V1 L1 M1 H1 R1 V2 L2 M2 H2 R2 ...
@@ -502,7 +636,9 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
         0              5              10*/
 
 
+        /*获取当前档位对应的原始ADC值*/
         current_adc_raw = ADC_SelectCurrentRaw(sample_row,current_range);
+        /*获取参考通道原始ADC值*/
         ref_adc_raw = sample_row[IDX_REF];
 
         /*
@@ -522,6 +658,16 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
         s_auto_debug.delta_adc_raw = delta_adc_raw;
         s_auto_debug.ref_adc_raw = ref_adc_raw;
         s_auto_debug.abs_delta_adc_raw = abs_delta_adc_raw;
+
+        /*
+        * 只有通过切档稳定期检查的有效数据才参与LCD平均。
+        * USB波形包仍然使用原来的原始数据链路。
+        */
+        Data_Monitor_Update(sample_row[IDX_VOL],
+                            current_adc_raw,
+                            ref_adc_raw,
+                            current_range);
+
 
         if (!decision_enabled)
         {
@@ -865,6 +1011,8 @@ HAL_StatusTypeDef ADC_Sampling_Start(void)
     memset(s_adc_snapshot, 0, sizeof(s_adc_snapshot));
     s_adc_snapshot_seq = 0U;
     s_adc_snapshot_valid = false;
+    /* 新一轮ADC采样不能沿用上一次LCD平均值。 */
+    Data_Monitor_Clear();
 
     memset(s_adc_block_queue, 0, sizeof(s_adc_block_queue));
     s_adc_block_write_index = 0U;
@@ -985,7 +1133,7 @@ bool ADC_GetRawAverage(ADC_RawAverage_T *average)
         }
     }
 
-
+    /*3.分别累加5通道的ADC值，用一个数组存储起来*/
     for ( row = 0; row < ADC_TIMES; row++)
     {
         for ( channel = 0; channel < ADC_CHANNELS; channel++)
@@ -1257,30 +1405,30 @@ static uint8_t ADC_BlockQueue_NextIndex(uint8_t index)
  */
 static void ADC_BlockQueue_PublishFromISR(const uint16_t *source)
 {
-    uint8_t write_index;
-    uint8_t next_index;
-    ADC_BlockSlot_T *slot;
+    uint8_t write_index;        //当前写指针
+    uint8_t next_index;         //下一个写指针
+    ADC_BlockSlot_T *slot;      //这个是指向当前写指针的槽位指针，用于填充数据
 
-    write_index = s_adc_block_write_index;
-    next_index = ADC_BlockQueue_NextIndex(write_index);
+    write_index = s_adc_block_write_index;              //获取当前写指针
+    next_index = ADC_BlockQueue_NextIndex(write_index);   //获取下一个写指针
 
     /* 每次DMA半区完成都占用一个序号，丢块后任务能识别序号断点。 */
     s_adc_block_sequence++;
 
-    if (next_index == s_adc_block_read_index)
+    if (next_index == s_adc_block_read_index)       //如果下一个写指针等于读指针，说明队列已满
     {
-        s_adc_block_drop_count++;
+        s_adc_block_drop_count++;                   //丢弃最新块并累计计数
         return;
     }
 
-    slot = &s_adc_block_queue[write_index];
-    slot->sequence = s_adc_block_sequence;
-    slot->sample_range = Gate_get_status();
-    memcpy(slot->samples, source, sizeof(slot->samples));
+    slot = &s_adc_block_queue[write_index];              //获取当前写指针对应的槽位指针
+    slot->sequence = s_adc_block_sequence;                 //设置数据序号
+    slot->sample_range = Gate_get_status();              //设置当前真实档位
+    memcpy(slot->samples, source, sizeof(slot->samples)); //复制数据到槽位中
 
     /* 数据全部写完后才能发布新的写指针。 */
     __DMB();
-    s_adc_block_write_index = next_index;
+    s_adc_block_write_index = next_index;              //更新写指针
 }
 
 /**
@@ -1322,11 +1470,11 @@ uint32_t ADC_ProcessPendingBlocks(void)
          * 错误发生前后数据的连续性已经无法保证。
          * 丢掉此刻已经排队的块，防止把错误两侧的采样拼成一次连续确认。
          */
-        error_discard_count = 0U;
-        published_write_index = s_adc_block_write_index;
+        error_discard_count = 0U;       //错误丢弃的块数量清0
+        published_write_index = s_adc_block_write_index;    //获取当前写指针
 
         while (s_adc_block_read_index != published_write_index)
-        {
+        {   /* 当读指针不等于写指针时，说明队列中还有数据 */
             s_adc_block_read_index =
                 ADC_BlockQueue_NextIndex(s_adc_block_read_index);
             error_discard_count++;
@@ -1335,8 +1483,8 @@ uint32_t ADC_ProcessPendingBlocks(void)
         s_adc_last_processed_sequence = 0U;
 
         ADC_AutoRange_DebugWriteBegin();
-        s_auto_debug.state = ADC_RANGE_STATE_HOLD;
-        s_auto_debug.lost_block_count += error_discard_count;
+        s_auto_debug.state = ADC_RANGE_STATE_HOLD;              //设置状态为保持
+        s_auto_debug.lost_block_count += error_discard_count;    //累计丢弃的块数量
         ADC_AutoRange_UpdateDebugCount();
         ADC_AutoRange_DebugWriteEnd();
 
@@ -1345,19 +1493,21 @@ uint32_t ADC_ProcessPendingBlocks(void)
 
     for (;;)
     {
-        read_index = s_adc_block_read_index;
+        read_index = s_adc_block_read_index;     //获取当前读指针
 
         if (read_index == s_adc_block_write_index)
         {
+            /* 当读指针等于写指针时，说明队列已空 */
             break;
         }
-
+        /* 执行到这里说明队列中还有数据 */
         /* 先确认写指针已经发布，再读取对应槽位。 */
         __DMB();
         slot = &s_adc_block_queue[read_index];
         block_sequence = slot->sequence;
 
         /* 序号不连续说明中间确实丢过块，连续确认必须重新开始。 */
+        /*举例：当前处理到序号为100，读取到序号为102，说明中间丢了一块数据。*/
         if ((s_adc_last_processed_sequence != 0U) &&
             (block_sequence != (s_adc_last_processed_sequence + 1U)))
         {

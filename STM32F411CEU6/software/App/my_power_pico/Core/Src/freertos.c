@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "user_TasksInit.h"
 #include "user_CmdStrategy.h"
+#include "user_LVGLTask.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -51,7 +52,7 @@
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 256 * 4,
+  .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -130,9 +131,8 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    CmdStrategy_Process();
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-
+    CmdStrategy_Process();  //命令处理任务
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);  //心跳灯任务
     /* 低速后台任务周期。 */
     osDelay(200U);
   }
@@ -141,7 +141,15 @@ void StartDefaultTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-
-
+/**
+ * @brief FreeRTOS系统节拍回调
+ *
+ * 当前configTICK_RATE_HZ为1000Hz，
+ * 因此每次调用代表经过1ms。
+ */
+void vApplicationTickHook(void)
+{
+    TaskTickHook();
+}
 /* USER CODE END Application */
 

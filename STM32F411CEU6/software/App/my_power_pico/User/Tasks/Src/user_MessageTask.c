@@ -236,19 +236,15 @@ void MessageReceiveTask(void *argument)
 }
 
 /**
- * @brief 把最新测量结果发送给显示任务
+ * @brief 把ADC统计后的平均测量结果发送给显示任务
  *
- * 数据来源：
- * - 电压：最近一个完整ADC块的电压通道平均值；
- * - 电流：自动量程算法最近处理完成的电流结果；
- * - 档位：产生该电流数据时的真实采样档位。
- *
- * @note 本函数只能在MessageSendTask中调用，不能在ADC中断中调用。
+ * @note
+ * 电压和电流都来自约250ms的统计窗口。
+ * USB波形上传仍然保持原来的原始采样数据，不受本函数影响。
  */
 static void Step6D_PublishPowerData(void)
 {
-    ADC_RawAverage_T raw_average;
-    ADC_AutoRangeDebug_T debug;
+
     PowerData_T new_data = {0};
     PowerData_T discarded;
 
@@ -261,35 +257,17 @@ static void Step6D_PublishPowerData(void)
         return;
     }
 
-    /*
-     * ADC还没有产生有效数据时不发送。
-     * LvHandlerTask会暂时显示WAIT QUEUE。
-     */
-    if (!ADC_GetRawAverage(&raw_average)
-        || !ADC_AutoRange_GetDebug(&debug))
+    /*当刚刚上电时，未累计够第一组250ms数据时先不发布*/
+    if (!Data_Monitor_GetValues(&new_data.voltage_v,
+                                &new_data.current_ua,
+                                &new_data.range))
     {
         return;
     }
 
-    /* 电压通道原始平均值换算成VBUS电压，单位V。 */
-    new_data.voltage_v =
-        ADC_ConvertVoltage_V(raw_average.vol_raw);
 
     /*
-     * 电流必须使用产生该数据时的sample_range换算。
-     * 不能直接使用current_range，因为切档瞬间两者可能不同。
-     */
-    new_data.current_ua =
-        ADC_ConvertCurrent_uA(debug.current_adc_raw,
-                              debug.ref_adc_raw,
-                              debug.sample_range);
-
-    new_data.range = debug.sample_range;
-
-    /*
-     * timeout=0，表示绝不阻塞高优先级MessageSendTask。
-     * 队列满时先丢掉最旧数据，再放入最新数据。
-     * LCD显示只关心最新测量值，旧数据没有继续排队的价值。
+     * 队列满时丢弃最旧值，只保留最新显示结果。
      */
     if (osMessageQueuePut(PowerDataQueue,
                           &new_data,
@@ -323,18 +301,18 @@ static void Step6D_PublishPowerData(void)
  */
 void MessageSendTask(void *argument)
 {
-    uint32_t flags;
-    uint32_t wait_time;
-    uint32_t processed_count;
-    uint32_t ui_block_count = 0U;
+    uint32_t flags;                 //等待的事件标志位
+    uint32_t wait_time;             //等待时间，单位ms
+    uint32_t processed_count;       //本次处理的数据块数量
+    uint32_t ui_block_count = 0U;   //累计处理的数据块数量
 
-    uint32_t wave_div_count = 0U;
-    uint32_t last_wave_sequence = 0U;
-    uint32_t latest_wave_sequence;
-    uint32_t new_wave_count;
+    uint32_t wave_div_count = 0U;      //波形包发送次数
+    uint32_t last_wave_sequence = 0U;  //上一个波形包序号
+    uint32_t latest_wave_sequence;     //最新波形包序号
+    uint32_t new_wave_count;           //新波形包数量
 
-    CmdTxFrame_T pending_command;
-    USB_ADC_Packet_T pending_adc;
+    CmdTxFrame_T pending_command;     //待发送的命令回复
+    USB_ADC_Packet_T pending_adc;     //待发送的ADC波形包
 
     /*
      * active_tx必须能够容纳最大的波形包。
@@ -342,30 +320,37 @@ void MessageSendTask(void *argument)
      */
     uint8_t active_tx[sizeof(USB_ADC_Packet_T)];
 
-    const uint8_t *next_data;
-    uint16_t next_length;
+    const uint8_t *next_data;       //待发送的数据指针
+    uint16_t next_length;          //待发送的数据长度
 
-    bool command_pending = false;
-    bool adc_pending = false;
-    bool usb_tx_active = false;
-    bool next_is_command;
+    bool command_pending = false;  //是否有待发送的命令回复
+    bool adc_pending = false;       //是否有待发送的ADC波形包
+    bool usb_tx_active = false;     //USB发送是否正在处理
+    bool next_is_command;          //下一个待发送数据是否为命令回复
 
-    uint8_t usb_tx_result;
+    uint8_t usb_tx_result;          //USB发送结果
 
     (void)argument;
 
     for (;;)
     {
-        /*
+        /*1.
          * USB空闲且有待发数据时，每1ms重试一次。
          * USB发送中时，等待发送完成、ADC或命令事件。
          */
         wait_time =
-            (!usb_tx_active
-             && (command_pending || adc_pending))
+            (!usb_tx_active                     //USB发送是否正在处理
+             && (command_pending || adc_pending))//是否有待发送的命令回复或ADC波形包
             ? 1U
             : osWaitForever;
 
+
+        /*2.
+        这里等待的事件标志位是：
+         * 1. ADC_FLAG_ALL_EVENTS：ADC模块产生的数据块
+         * 2. FLAG_CMD_TX_READY：CmdTxQueue取出的命令回复
+         * 3. FLAG_USB_TX_COMPLETE：USB发送完成
+        */
         flags = osThreadFlagsWait(
             ADC_FLAG_ALL_EVENTS
                 | FLAG_CMD_TX_READY
@@ -373,38 +358,47 @@ void MessageSendTask(void *argument)
             osFlagsWaitAny,
             wait_time);
 
-        /*
+        /*3.
          * 1ms等待超时不是故障。
          * 清成0后继续尝试发送pending数据。
          */
         if ((flags & osFlagsError) != 0U)
         {
+            /*osFlagsError：等待超时不是故障*/
             flags = 0U;
         }
 
         if ((flags & FLAG_USB_TX_COMPLETE) != 0U)
         {
+            /*FLAG_USB_TX_COMPLETE：USB发送完成*/
             usb_tx_active = false;
         }
 
-        processed_count = 0U;
+        /*执行到这里说明程序等待超时不是故障，或者USB发送完成，那么准备处理数据块
+        processed_count = 0 是为了清空上次处理的数据块数量，避免重复处理*/
+        processed_count = 0U;//本次处理的数据块数量
 
         if ((flags & ADC_FLAG_ALL_EVENTS) != 0U)
         {
+            /*ADC_FLAG_ALL_EVENTS：ADC模块产生的数据块*/
             processed_count =
-                ADC_ProcessPendingBlocks();
+                ADC_ProcessPendingBlocks();//处理ADC模块产生的数据块
         }
 
         /* 保留原来的LCD数据发布节拍。 */
         ui_block_count += processed_count;
 
+        /*这里用大白话讲一下：
+        1. ui_block_count 是累计处理的数据块数量，每次处理ADC模块产生的数据块后，会更新这个值。
+        2. STEP6D_UI_PUBLISH_BLOCKS 是LCD数据发布节拍，每处理STEP6D_UI_PUBLISH_BLOCKS个数据块，就会发布一次LCD数据。
+        3. 这里用取余运算 % 来实现循环发布，避免数据丢失。*/
         if (ui_block_count
             >= STEP6D_UI_PUBLISH_BLOCKS)
         {
             ui_block_count %=
                 STEP6D_UI_PUBLISH_BLOCKS;
 
-            Step6D_PublishPowerData();
+            Step6D_PublishPowerData();//发布最新测量结果给LCD任务
         }
 
         /*
@@ -588,7 +582,5 @@ void MessageSendTask(void *argument)
         }
     }
 }
-
-
 
 

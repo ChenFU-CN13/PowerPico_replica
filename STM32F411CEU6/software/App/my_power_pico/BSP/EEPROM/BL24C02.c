@@ -19,7 +19,6 @@ typedef struct
     uint8_t language_select;       // 语言：0英文，1中文
     uint16_t rotation;             // 屏幕方向：0、90、180或270
     uint8_t current_range_mode;    // AUTO、LOW、MID或HIGH
-
     ADC_Calibration_T adc_calibration; // 三档电流校准参数
 } SysSettings_T;
 
@@ -336,11 +335,20 @@ bool EEPROM_SysSetting_Load(void)
  */
 bool EEPROM_SysSetting_Save(void)
 {
+    SysSettings_T snapshot;
+    /*
+     * 先复制一份稳定快照。
+     * EEPROM写入时间较长，不能在写入过程中继续直接读取全局结构。
+     */
+    __disable_irq();
+    snapshot = s_sys_settings;
+    __enable_irq();
+
     /*
      * 保存前再检查一次RAM副本。
      * 防止异常数据被写入EEPROM，导致下次启动继续加载错误参数。
      */
-    if (!SysSettings_IsValid(&s_sys_settings))
+    if (!SysSettings_IsValid(&snapshot))
     {
         return false;
     }
@@ -351,8 +359,8 @@ bool EEPROM_SysSetting_Save(void)
      */
     return EEPROM_WriteBytes(
         EEPROM_SYS_SETTINGS_ADDRESS,
-        (const uint8_t *)&s_sys_settings,
-        (uint16_t)sizeof(s_sys_settings));
+        (const uint8_t *)&snapshot,
+        (uint16_t)sizeof(snapshot));
 }
 
 
@@ -375,7 +383,13 @@ bool Sys_Set_AdcCalibration(
         return false;
     }
 
+    /*
+     * 六个float作为一组整体更新，
+     * 防止其他任务在复制中途读取到混合参数。
+     */
+    __disable_irq();
     s_sys_settings.adc_calibration = *calibration;
+    __enable_irq();
     return true;
 }
 
@@ -392,7 +406,91 @@ void Sys_Get_AdcCalibration(
         return;
     }
 
-    *calibration =
-        s_sys_settings.adc_calibration;
+    /*
+     * 保证调用者取得的是同一时刻的一整组参数。
+     */
+    __disable_irq();
+    *calibration = s_sys_settings.adc_calibration;
+    __enable_irq();
 }
 
+bool Sys_Set_BacklightLevel(uint8_t level)
+{
+    if (level > 100U)
+    {
+        return false;
+    }
+
+    s_sys_settings.backlight_level = level;
+    return true;
+}
+
+bool Sys_Set_KeySoundEnable(bool enable)
+{
+    s_sys_settings.key_sound_enable = enable ? 1U : 0U;
+    return true;
+}
+
+bool Sys_Set_LanguageSelect(uint8_t language)
+{
+    if (language > 1U)
+    {
+        return false;
+    }
+
+    s_sys_settings.language_select = language;
+    return true;
+}
+
+bool Sys_Set_Rotation(uint16_t rotation)
+{
+    if (rotation != 0U
+        && rotation != 90U
+        && rotation != 180U
+        && rotation != 270U)
+    {
+        return false;
+    }
+
+    s_sys_settings.rotation = rotation;
+    return true;
+}
+
+bool Sys_Set_CurrentRangeMode(uint8_t mode)
+{
+    if (mode != GATE_MODE_AUTO
+        && mode != GATE_MODE_LOW
+        && mode != GATE_MODE_MID
+        && mode != GATE_MODE_HIGH)
+    {
+        return false;
+    }
+
+    s_sys_settings.current_range_mode = mode;
+    return true;
+}
+
+uint8_t Sys_Get_BacklightLevel(void)
+{
+    return s_sys_settings.backlight_level;
+}
+
+bool Sys_Get_KeySoundEnable(void)
+{
+    return s_sys_settings.key_sound_enable != 0U;
+}
+
+uint8_t Sys_Get_LanguageSelect(void)
+{
+    return s_sys_settings.language_select;
+}
+
+uint16_t Sys_Get_Rotation(void)
+{
+    return s_sys_settings.rotation;
+}
+
+uint8_t Sys_Get_CurrentRangeMode(void)
+{
+    return s_sys_settings.current_range_mode;
+}

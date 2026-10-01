@@ -479,9 +479,29 @@ static bool responder_vender_def(PD_protocol_t * p, uint16_t * header, uint32_t 
  */
 void PD_protocol_handle_msg(PD_protocol_t * p, uint16_t header, uint32_t * obj, PD_protocol_event_t * events)
 {
-    #define EXT_MSG_LIMIT   (sizeof(ext_msg_list) / sizeof(ext_msg_list[0]) - 1)
-    #define DATA_MSG_LIMIT  (sizeof(data_msg_list) / sizeof(data_msg_list[0]) - 1)
-    #define CTRL_MSG_LIMIT  (sizeof(ctrl_msg_list) / sizeof(ctrl_msg_list[0]) - 1)
+    /* ===== 三张消息分发表的"最大合法下标"宏 =====
+     *
+     * 背景：PD 消息按"扩展位(bit15) + 有无数据对象"被分到三张表：
+     *   ext_msg_list   扩展消息表（bit15=1）
+     *   data_msg_list  数据消息表（bit15=0 且 num_of_obj != 0）
+     *   ctrl_msg_list  控制消息表（bit15=0 且 num_of_obj == 0）
+     *
+     * 每张表的布局相同：
+     *   下标 0~15  → 与 PD 协议规定的 5bit 消息 type(0~15) 一一对应
+     *   下标 16    → 协议保留(Reserved)消息的统一兜底项 C_R/D_R/E_R
+     *                （该项 handler=0、responder=Not_Supported，收到未识别消息统一拒绝）
+     *
+     * sizeof(表)/sizeof(表[0]) = 数组总项数 = 17
+     * 再 -1 得到 16，即"兜底项下标"，作为查表时允许的最大下标 LIMIT。
+     *
+     * 配合下方三元表达式 h.type > LIMIT ? LIMIT : h.type 使用：
+     *   - h.type 为 0~16 ：正常按下标查表
+     *   - h.type 为 17~31（type 字段共 5bit，可能出现越界的保留值）：
+     *     钳位到 16，走 Reserved 兜底项，杜绝数组越界访问。
+     */
+    #define EXT_MSG_LIMIT   (sizeof(ext_msg_list) / sizeof(ext_msg_list[0]) - 1)  // 扩展表最大下标=16(兜底项)
+    #define DATA_MSG_LIMIT  (sizeof(data_msg_list) / sizeof(data_msg_list[0]) - 1) // 数据表最大下标=16(兜底项)
+    #define CTRL_MSG_LIMIT  (sizeof(ctrl_msg_list) / sizeof(ctrl_msg_list[0]) - 1) // 控制表最大下标=16(兜底项)
 
     const struct PD_msg_state_t * state; // 本帧最终匹配到的分发表项。
     PD_msg_header_info_t h;              // 拆出的 type、版本、MessageID 和对象数。
@@ -624,18 +644,43 @@ bool PD_protocol_select_power(PD_protocol_t * p, uint8_t index)
 }
 
 /**
- * @brief 更新 PPS 目标值，并从能力表中选择覆盖该目标的 APDO。
- * @param strict true 时没有匹配 APDO就拒绝更新；false 时允许保存目标并回退到下标 0。
- * @return true：参数发生变化且需要重发 Request；false：不需要发送。
- */
+  * @brief  设置 PPS（Programmable Power Supply）目标电压/电流，并从充电器广播的
+  *         能力表中挑选一个能覆盖该目标的 PPS APDO（Augmented PDO）。
+  *
+  * @param  p           : PD 协议实例指针，内部保存着最近收到的 Source_Capabilities
+  *                       能力表（power_data_obj[]）及当前选中对象下标。
+  * @param  PPS_voltage : 目标电压，单位 = 20 mV/步（PPS RDO 协议规定的单位）。
+  *                       例如请求 5.00 V 应传入 250；请求 9.00 V 传入 450。
+  *                       上层一般用宏 PPS_V(5.0) 把伏特换算成该单位。
+  * @param  PPS_current : 目标电流，单位 = 50 mA/步（PPS RDO 协议规定的单位）。
+  *                       例如请求 1.0 A 应传入 20；请求 3.0 A 传入 60。
+  *                       上层一般用宏 PPS_A(1.0) 把安培换算成该单位。
+  * @param  strict      : 匹配策略开关。
+  *                       - true  : 能力表中找不到能覆盖目标的 APDO 时，拒绝本次更新，
+  *                                 保留旧目标（用于用户手动调电压时的合法性校验）。
+  *                       - false : 即使找不到（selected=0，回退到第 0 项 5V Fixed PDO），
+  *                                 也照样保存新目标值（用于刚 START、能力表还没到时预填，
+  *                                 等 Source_Capabilities 到达后协议层会重新匹配）。
+  *
+  * @retval true  : 目标值发生了变化，且已更新选中对象，调用方需要重发一次 Request
+  *                 消息让充电器按新参数调整输出（对应 PDUFPTask 里的 send_power_request()）。
+  * @retval false : 新旧目标完全相同，或 strict=true 且无匹配 APDO，无需重发。
+  *
+  * @note   执行过程：
+  *           1) 比较新旧目标，完全相同则直接返回 false，避免无意义的重复请求；
+  *           2) 调 evaluate_src_cap() 扫描能力表：逐项解码 PDO/APDO，找到第一个
+  *              "电压范围覆盖目标 且 电流能力足够"的 APDO，返回其下标；找不到返回 0；
+  *           3) strict=false 或确实找到匹配项时，把目标值与选中下标写入协议实例；
+  *           4) 返回 true 通知上层"参数变了，该发 Request 了"。
+  */
 bool PD_protocol_set_PPS(PD_protocol_t * p, uint16_t PPS_voltage, uint8_t PPS_current, bool strict)
 {
     if (p->PPS_voltage != PPS_voltage || p->PPS_current != PPS_current) { // 值没变就不重复申请。
         uint8_t selected = evaluate_src_cap(p, PPS_voltage, PPS_current); // 查找匹配 APDO，下标 0 同时承担“没找到”含义。
         if (selected || !strict) {             // strict=false 时即使没找到也接受新目标并使用回退项。
-            p->PPS_voltage = PPS_voltage;      // 保存 20 mV 单位的目标电压。
-            p->PPS_current = PPS_current;      // 保存 50 mA 单位的目标电流。
-            p->power_data_obj_selected = selected; // 保存后续 RDO 使用的对象下标。
+            p->PPS_voltage = PPS_voltage;      // 保存目标电压（单位 20mV/LSB），后续组 PPS RDO 的 B19~B9 字段时直接使用。
+            p->PPS_current = PPS_current;      // 保存目标电流（单位 50mA/LSB），后续组 PPS RDO 的 B8~B0 字段时直接使用。
+            p->power_data_obj_selected = selected; // 保存后续 RDO 使用的对象下标（Object Position B30~B28 要填它+1）。
             return true;    /* need to re-send request */            
         }
     }

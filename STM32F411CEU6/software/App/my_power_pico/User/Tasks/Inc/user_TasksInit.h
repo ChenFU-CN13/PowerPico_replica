@@ -9,6 +9,7 @@ extern "C" {
 #include "cmsis_os.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include "user_PDUFPTask.h"
 
 
 /*
@@ -18,9 +19,9 @@ extern "C" {
 #define CMD_RX_CHUNK_SIZE      64U
 #define CMD_RX_QUEUE_DEPTH     8U
 
+
 /*
  * MessageSendTask使用的USB发送事件标志。
- *
  * bit0、bit1已经被ADC_FLAG_BLOCK_READY和ADC_FLAG_ERROR使用，
  * 所以USB相关事件从bit2开始。
  */
@@ -62,32 +63,6 @@ typedef struct
     uint16_t length;                    // 回复帧有效长度
     uint8_t data[CMD_TX_FRAME_SIZE];    // 回复帧内容
 } CmdTxFrame_T;
-
-/**
- * @brief UI发送给PD任务的命令
- *
- * 本轮只确定消息格式，不启动PD协议。
- */
-typedef enum
-{
-    PD_CMD_START = 0,
-    PD_CMD_STOP,
-    PD_CMD_SET_PPS,
-    PD_CMD_SET_FIXED
-} PDCommand_T;
-
-
-/**
- * @brief 一条完整的PD控制命令
- */
-typedef struct
-{
-    PDCommand_T event;       // 启动、停止、PPS或固定档命令
-    float voltage_v;         // PPS目标电压
-    float current_a;         // PPS目标电流
-    uint8_t fixed_level;     // 固定PDO档位编号
-    uint8_t reserved[3];     // 结构体对齐
-} PDCommandMsg_T;
 
 /**
  * @brief 用户任务框架状态
