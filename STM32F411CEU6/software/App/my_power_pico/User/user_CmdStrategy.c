@@ -31,23 +31,31 @@
 #include <string.h>
 
 
-#define CMD_PROTOCOL_MAX_PAYLOAD    48U     // 单帧业务数据最大 48 字节。
-#define CMD_PROTOCOL_FRAME_OVERHEAD 10U     // 帧头2 + 版本1 + 类型1 + 序号2 + 长度2 + CRC2
-#define CMD_PROTOCOL_RX_BUFFER_SIZE 64U     // 缓冲区大小为64
+#define CMD_PROTOCOL_MAX_PAYLOAD     48U
+#define CMD_PROTOCOL_FRAME_OVERHEAD  10U
+#define CMD_PROTOCOL_MAX_FRAME_SIZE  \
+    (CMD_PROTOCOL_FRAME_OVERHEAD + CMD_PROTOCOL_MAX_PAYLOAD)
 
-#define CMD_RESPONSE_MASK    0x80U   // 回复命令号最高位置1
+/* 最多暂存两帧，处理USB粘包 */
+#define CMD_PROTOCOL_RX_BUFFER_SIZE  \
+    (CMD_PROTOCOL_MAX_FRAME_SIZE * 2U)
+
+#define CMD_RESPONSE_MASK            0x80U
+
 /**
  * @brief 命令执行结果
  */
 typedef enum
 {
-    CMD_STATUS_OK = 0,                    // 命令执行成功
-    CMD_STATUS_UNSUPPORTED_VERSION = 1,  // 协议版本不支持
-    CMD_STATUS_UNSUPPORTED_COMMAND = 2,  // 命令号未实现
-    CMD_STATUS_INVALID_LENGTH = 3,       // payload长度错误
-    CMD_STATUS_INVALID_PARAMETER = 4     // 参数内容错误
+    CMD_STATUS_OK = 0,                   // 命令执行成功
+    CMD_STATUS_UNSUPPORTED_VERSION = 1, // 协议版本不支持
+    CMD_STATUS_UNSUPPORTED_COMMAND = 2, // 命令号未实现
+    CMD_STATUS_INVALID_LENGTH = 3,      // payload长度错误
+    CMD_STATUS_INVALID_PARAMETER = 4,   // 参数内容错误
+    CMD_STATUS_EEPROM_ERROR = 5,        // EEPROM保存失败
+    CMD_STATUS_BUSY = 6,                // 预留忙状态
+    CMD_STATUS_CRC_ERROR = 7            // 预留CRC错误状态
 } CmdStatus_T;
-
 /**
  * @brief 从接收字节流中解析出的完整命令
  */
@@ -90,6 +98,67 @@ static void CmdStrategy_WriteU16(uint8_t *destination,
 {
     destination[0] = (uint8_t)(value & 0xFFU);
     destination[1] = (uint8_t)(value >> 8);
+}
+
+
+
+
+/**
+ * @brief 按小端顺序写入32位无符号数
+ * @param destination 输出字节流
+ * @param value 要写入的32位数据
+ */
+static void CmdStrategy_WriteU32(uint8_t *destination,uint32_t value)
+{
+    destination[0] = (uint8_t)(value&0XFF);
+    destination[1] = (uint8_t)((value>>8)&0XFF);
+    destination[2] = (uint8_t)((value>>16)&0XFF);
+    destination[3] = (uint8_t)((value>>24));
+}
+
+/**
+ * @brief 从小端字节流读取32位无符号数
+ * @param source 输入字节流
+ * @return 读取到的32位数据
+ */
+static uint32_t CmdStrategy_ReadU32(const uint8_t *source)
+{
+    return (uint32_t)source[0]
+     |((uint32_t)source[1] << 8)
+     |((uint32_t)source[2] << 16)
+     |((uint32_t)source[3] << 24);
+}
+
+
+/**
+ * @brief 把float原始位模式按小端顺序写入协议
+ * @param destination 输出字节流
+ * @param value 要写入的浮点数
+ */
+static void CmdStrategy_WriteFloat(uint8_t *destination, float value)
+{
+
+    uint32_t bit;
+    /*
+     * 使用memcpy保留float原始位模式。
+     * 不使用uint32_t指针强转，避免未对齐访问和严格别名问题。
+     */
+    memcpy(&bit,&value,sizeof(bit));
+    CmdStrategy_WriteU32(destination,bit);
+}
+
+/**
+ * @brief 从协议的小端4字节恢复float
+ * @param source 输入字节流
+ * @return 恢复出的浮点数
+ */
+static float CmdStrategy_ReadFloat(const uint8_t *source)
+{
+    uint32_t bits;
+    float value;
+    bits = CmdStrategy_ReadU32(source);
+    memcpy(&value,&bits,sizeof(value));
+    return value;
 }
 
 /**
@@ -269,15 +338,11 @@ static bool CmdStrategy_TryGetFrame(CmdFrame_T *frame)
         {
             /*
              * 特殊情况：
-             *
              * 当前缓存最后一个字节是0xA5，
              * 它可能是一个被USB拆开的帧头前半部分。
-             *
              * 例如：
-             *
              * 第一包：11 22 A5
              * 第二包：5A 01 10 ...
-             *
              * 此时必须保留最后的0xA5，
              * 等待下一包开头的0x5A。
              */
@@ -342,7 +407,6 @@ static bool CmdStrategy_TryGetFrame(CmdFrame_T *frame)
 
         /*
          * payload不能超过协议规定的最大长度。
-         *
          * 如果超过上限，说明：
          *
          * 1. 当前0xA5 0x5A可能是假帧头；
@@ -508,8 +572,31 @@ static bool CmdStrategy_TryGetFrame(CmdFrame_T *frame)
 
 
 /**
- * @brief 编码一帧完整命令数据
- * @return 编码后的总长度，参数错误返回0
+ * @brief 编码一帧完整命令数据（请求帧和回复帧共用的底层组帧函数）
+ *
+ * 本函数把传入的类型/序列号/payload 按协议字节布局逐个写入输出缓冲区，
+ * 并在末尾补上 CRC16，形成可直接通过 USB 发送的完整字节帧。
+ *
+ * 生成的帧字节布局（小端序，多字节字段低字节在前）：
+ *
+ *   偏移   长度   字段
+ *   ─────────────────────────────────────────────
+ *   [0]    2     帧头 0xA5 0x5A
+ *   [2]    1     协议版本（固定 CMD_PROTOCOL_VERSION = 1）
+ *   [3]    1     命令类型（回复帧已在此前 |0x80）
+ *   [4]    2     序列号 sequence
+ *   [6]    2     payload 长度 payload_length
+ *   [8]    N     payload 业务数据（N = payload_length，可为 0）
+ *   [8+N]  2     CRC16
+ *   ─────────────────────────────────────────────
+ *   总长度 = 10 + payload_length = CMD_PROTOCOL_FRAME_OVERHEAD + payload_length
+ *
+ * @param type           命令类型字节；回复帧调用时传入 (原命令号 | 0x80)
+ * @param sequence       16 位命令序列号，用于上位机匹配请求与回复
+ * @param payload        业务数据首地址；payload_length=0 时可为 NULL
+ * @param payload_length 业务数据字节数，最大不超过 CMD_PROTOCOL_MAX_PAYLOAD(48)
+ * @param output         输出缓冲区首地址，需能容纳整帧（最大 58 字节）
+ * @return 编码后的整帧总长度；参数非法时返回 0
  */
 static uint16_t CmdStrategy_EncodeFrame(
     uint8_t type,
@@ -518,8 +605,13 @@ static uint16_t CmdStrategy_EncodeFrame(
     uint16_t payload_length,
     uint8_t *output)
 {
-    uint16_t crc;
+    uint16_t crc;   // 本帧计算出的 CRC16，写入帧尾
 
+    /* 入参合法性检查，三项任一成立都无法组帧：
+     * 1. output 为空：没有地方写结果；
+     * 2. payload 超长：超出协议上限，防止写爆 output；
+     * 3. payload 为空却声称有数据：memcpy 空指针会进硬件异常。
+     */
     if (output == NULL
         || payload_length > CMD_PROTOCOL_MAX_PAYLOAD
         || (payload == NULL && payload_length != 0U))
@@ -527,39 +619,74 @@ static uint16_t CmdStrategy_EncodeFrame(
         return 0U;
     }
 
-    output[0] = 0xA5U;
-    output[1] = 0x5AU;
-    output[2] = CMD_PROTOCOL_VERSION;
-    output[3] = type;
+    /* ---- 按偏移逐字段写入固定头部 ---- */
 
-    CmdStrategy_WriteU16(&output[4], sequence);
-    CmdStrategy_WriteU16(&output[6], payload_length);
+    output[0] = 0xA5U;                    // 帧头第1字节
+    output[1] = 0x5AU;                    // 帧头第2字节
+    output[2] = CMD_PROTOCOL_VERSION;     // 协议版本，固定为 1
+    output[3] = type;                     // 命令类型（回复时已带 0x80 标志）
 
+    /* 2 字节字段统一用 WriteU16 按小端写入（先低字节后高字节）。 */
+    CmdStrategy_WriteU16(&output[4], sequence);         // 序列号
+    CmdStrategy_WriteU16(&output[6], payload_length);   // payload 长度
+
+    /* 只有携带业务数据时才复制；payload_length=0 时跳过，
+     * output[8] 直接作为后续 CRC 的位置。
+     */
     if (payload_length != 0U)
     {
         memcpy(&output[8], payload, payload_length);
     }
 
     /*
-     * CRC从version开始计算，不包括A5 5A帧头。
+     * CRC 从 version（output[2]）开始计算，不包括 A5 5A 帧头。
+     *
+     * 参与 CRC 的数据 = 固定部分 6 字节
+     *   (version 1 + type 1 + sequence 2 + payload_length 2)
+     *   + payload_length 字节业务数据
+     * 即总长度 6 + payload_length。
      */
     crc = CmdStrategy_Crc16(
         &output[2],
         (uint16_t)(6U + payload_length));
 
+    /* 把 CRC 按小端写到 payload 之后（帧的最后 2 字节）。 */
     CmdStrategy_WriteU16(
         &output[8U + payload_length],
         crc);
 
+    /* 返回整帧长度：固定开销 10 + payload 长度。 */
     return (uint16_t)(
         CMD_PROTOCOL_FRAME_OVERHEAD + payload_length);
 }
 
 /**
- * @brief 编码命令回复
+ * @brief 编码命令回复帧
  *
- * 回复payload第一个字节固定为状态码，
- * 后面才是命令自己的返回数据。
+ * 本函数在调用底层 EncodeFrame 之前，先把"状态码 + 命令返回数据"拼成
+ * 回复帧专用的 payload。这是回复帧与请求帧在结构上的唯一区别。
+ *
+ * 回复帧 payload 布局：
+ *
+ *   偏移(相对payload)   长度   字段
+ *   ────────────────────────────────────────────
+ *   [0]                1     状态码 status（必有）
+ *   [1]                M     命令返回数据（M = payload_length，可为 0）
+ *   ────────────────────────────────────────────
+ *   回复 payload 总长度 = 1 + payload_length
+ *
+ * 注意两个关键点：
+ * 1. 状态码固定占据 payload[0]，所以即使命令执行失败、没有任何返回数据，
+ *    回复帧的 payload 也至少有 1 字节（状态码），这与请求帧允许 payload=0 不同；
+ * 2. 调用 EncodeFrame 时命令类型要 | CMD_RESPONSE_MASK(0x80)，
+ *    例如请求 0x11 的回复类型为 0x91，供上位机区分收发方向。
+ *
+ * @param request        对应的请求帧（从中取命令号和序列号回填到回复）
+ * @param status         命令执行状态码（OK / 各类错误码）
+ * @param payload        命令返回的业务数据首地址；payload_length=0 时可为 NULL
+ * @param payload_length 命令返回数据的字节数（不含状态码）
+ * @param output         输出缓冲区首地址，存放最终回复帧
+ * @return 回复帧整帧长度；参数非法时返回 0
  */
 static uint16_t CmdStrategy_EncodeResponse(
     const CmdFrame_T *request,
@@ -568,8 +695,17 @@ static uint16_t CmdStrategy_EncodeResponse(
     uint16_t payload_length,
     uint8_t *output)
 {
+    /* 回复专用 payload：第0字节状态码 + 后续返回数据。
+     * 用局部数组拼装，避免改动调用方传入的 payload 原数据。
+     */
     uint8_t response_payload[CMD_PROTOCOL_MAX_PAYLOAD];
 
+    /* 入参合法性检查：
+     * 1/2. request、output 为空无法工作；
+     * 3. 注意这里用 >= 而非 >：因为还要再塞 1 字节状态码，
+     *    返回数据若已达 48，加上状态码会变成 49 超出上限；
+     * 4. payload 为空却声称有数据，memcpy 会触发硬件异常。
+     */
     if (request == NULL
         || output == NULL
         || payload_length >= CMD_PROTOCOL_MAX_PAYLOAD
@@ -578,8 +714,10 @@ static uint16_t CmdStrategy_EncodeResponse(
         return 0U;
     }
 
+    /* 状态码固定放在回复 payload 的第 0 字节。 */
     response_payload[0] = (uint8_t)status;
 
+    /* 命令返回数据紧跟状态码之后；没有返回数据时跳过。 */
     if (payload_length != 0U)
     {
         memcpy(&response_payload[1],
@@ -587,6 +725,11 @@ static uint16_t CmdStrategy_EncodeResponse(
                payload_length);
     }
 
+    /* 交给通用组帧函数完成最终打包：
+     * - 类型 |= 0x80 标记这是回复；
+     * - 序列号原样回填，保证上位机能对应到原请求；
+     * - payload 长度传 (payload_length + 1)，多出的 1 是状态码。
+     */
     return CmdStrategy_EncodeFrame(
         (uint8_t)(request->type | CMD_RESPONSE_MASK),
         request->sequence,
@@ -595,45 +738,373 @@ static uint16_t CmdStrategy_EncodeResponse(
         output);
 }
 
+
+/**
+ * @brief 把三档六个校准参数编码成24字节
+ * @param payload 输出载荷
+ * @param calibration 校准参数
+ *
+ * 字节顺序：
+ * [0..3]   LOW增益
+ * [4..7]   LOW零点偏移，单位uA
+ * [8..11]  MID增益
+ * [12..15] MID零点偏移，单位uA
+ * [16..19] HIGH增益
+ * [20..23] HIGH零点偏移，单位uA
+ */
+static void CmdStrategy_WriteCalibrationPayload(uint8_t *payload,const ADC_Calibration_T *calibration)
+{
+    CmdStrategy_WriteFloat(
+        &payload[0],
+        calibration->low_scale_multiplier);
+
+    CmdStrategy_WriteFloat(
+        &payload[4],
+        calibration->low_offset_ua);
+
+    CmdStrategy_WriteFloat(
+        &payload[8],
+        calibration->mid_scale_multiplier);
+
+    CmdStrategy_WriteFloat(
+        &payload[12],
+        calibration->mid_offset_ua);
+
+    CmdStrategy_WriteFloat(
+        &payload[16],
+        calibration->high_scale_multiplier);
+
+    CmdStrategy_WriteFloat(
+        &payload[20],
+        calibration->high_offset_ua);
+}
+
+
+
+/**
+ * @brief 从24字节载荷恢复三档校准参数
+ * @param calibration 校准参数输出地址
+ * @param payload 输入载荷
+ */
+static void CmdStrategy_ReadCalibrationPayload(ADC_Calibration_T *calibration,const uint8_t *payload)
+{
+    calibration->low_scale_multiplier =
+        CmdStrategy_ReadFloat(&payload[0]);
+
+    calibration->low_offset_ua =
+        CmdStrategy_ReadFloat(&payload[4]);
+
+    calibration->mid_scale_multiplier =
+        CmdStrategy_ReadFloat(&payload[8]);
+
+    calibration->mid_offset_ua =
+        CmdStrategy_ReadFloat(&payload[12]);
+
+    calibration->high_scale_multiplier =
+        CmdStrategy_ReadFloat(&payload[16]);
+
+    calibration->high_offset_ua =
+        CmdStrategy_ReadFloat(&payload[20]);
+}
+
+/**
+ * @brief 校验并保存校准参数
+ * @param calibration 新校准参数
+ * @return 命令执行状态
+ *
+ * EEPROM写入失败时恢复旧RAM参数，
+ * 防止RAM已经生效、EEPROM却没有保存。
+ */
+static CmdStatus_T CmdStrategy_SaveCalibration(const ADC_Calibration_T *calibration)
+{
+    ADC_Calibration_T previous;
+
+    /* 先备份当前正在使用的参数 */
+    Sys_Get_AdcCalibration(&previous);
+
+    /* 参数非法时不能覆盖旧参数 */
+    if (!Sys_Set_AdcCalibration(calibration))
+    {
+        return CMD_STATUS_INVALID_PARAMETER;
+    }
+    
+    /* 将整份系统设置写入EEPROM */
+    if (!EEPROM_SysSetting_Save())
+    {
+        /* EEPROM失败，恢复原来的RAM参数 */
+        (void)Sys_Set_AdcCalibration(&previous);
+        return CMD_STATUS_EEPROM_ERROR;
+
+    }
+    
+    return CMD_STATUS_OK;
+}
+
+
+
+
 /**
  * @brief 执行命令并生成回复
+ * 本函数是命令分发中心：根据请求帧的 cmd 字段路由到对应处理分支，
+ * 校验长度/参数合法性后填充回复 payload，再调用 EncodeResponse 打包。
+ * 调用上下文：MessageReceiveTask 中被 CmdStrategy_ProcessRx 调用，
+ *           属于任务上下文（非 ISR），可安全访问 EEPROM/GPIO。
+ * 回复命令号规则：响应帧 type = 请求 type | 0x80（在 EncodeResponse 内完成）。
+ * @param request   已解析完成的请求帧（帧头/CRC 已校验通过）
+ * @param response  输出参数，函数填充 length 和 data 后由调用者发送
  */
-static void CmdStrategy_Execute(
-    const CmdFrame_T *request,
-    CmdTxFrame_T *response)
+static void CmdStrategy_Execute(const CmdFrame_T *request, CmdTxFrame_T *response)
 {
     CmdStatus_T status = CMD_STATUS_OK;
-    uint8_t payload[2];
+    ADC_Calibration_T calibration;  //校准参数临时存储
+
+    /*
+     * 最大回复业务数据为48字节校准参数。
+     * 使用协议允许的最大空间，留1字节给状态码，所以最大值-1，留出47字节给业务回复
+     * 因为业务回复最大是6个float校准参数6*4=24字节。
+     */
+    uint8_t payload[CMD_PROTOCOL_MAX_PAYLOAD - 1] = {0};
     uint16_t payload_length = 0U;
 
     response->length = 0U;
 
-    if (request->version != CMD_PROTOCOL_VERSION)
-    {
+    /*1.检查协议版本是否支持*/
+    if (request -> version != CMD_PROTOCOL_VERSION)
+    {   
+        /*说明协议版本不对*/
         status = CMD_STATUS_UNSUPPORTED_VERSION;
     }
     else
     {
-        switch (request->type)
+        /*说明协议版本正确*/
+        /*开始根据命令类型分别执行业务逻辑*/
+        switch (request -> type)
         {
-            case CMD_RANGE_GET:
-                if (request->payload_length != 0U)
+            /*1.读取三档校准参数，下发 payload_length = 0，如果不为0说明数据帧出错，不可用*/
+            case CMD_CAL_GET:
+                if (request->payload_length != 0)
                 {
                     status = CMD_STATUS_INVALID_LENGTH;
                 }
                 else
                 {
+                    /*(1)先把当前正在使用的有效参数备份到RAM变量*/
+                    Sys_Get_AdcCalibration(&calibration);
+
                     /*
-                     * payload[0]：用户选择的AUTO/LOW/MID/HIGH模式
-                     * payload[1]：当前硬件实际接通的量程
+                     * 把六个float编码成固定顺序的24字节：
+                     *
+                     * [0..3]   LOW增益
+                     * [4..7]   LOW零点偏移
+                     * [8..11]  MID增益
+                     * [12..15] MID零点偏移
+                     * [16..19] HIGH增益
+                     * [20..23] HIGH零点偏移
+                     */
+                    CmdStrategy_WriteCalibrationPayload(payload,&calibration);
+                    /*6个float ，每个4字节*/
+                    payload_length = 24U;
+
+                }
+                break;
+        
+            case CMD_RANGE_GET:
+                /*2.读取当前量程模式以及实际硬件的档位*/
+                /*和上面一样，查询命令的payload长度为0*/
+                if (request->payload_length != 0)
+                {
+                    status = CMD_STATUS_INVALID_LENGTH;
+                }
+                else
+                {
+                                        /*
+                     * payload[0]：用户选择的控制模式
+                     *
+                     * 0 = AUTO
+                     * 1 = LOW
+                     * 2 = MID
+                     * 3 = HIGH
+                     *
+                     * payload[1]：硬件当前真正接通的量程
+                     *
+                     * 1 = LOW
+                     * 2 = MID
+                     * 3 = HIGH
                      */
                     payload[0] = Gate_Get_Mode();
                     payload[1] = Gate_get_status();
+
                     payload_length = 2U;
                 }
+                
+
+                break;
+
+            case CMD_RANGE_SET:
+                /*3.设置自动或者手动量程，这个是设置类命令，payload长度！=0才对
+                 * payload[0] = AUTO、LOW、MID或HIGH*/
+                if (request->payload_length != 1U)
+                {
+                    status = CMD_STATUS_INVALID_LENGTH;
+                }
+                else if (request->payload[0] > GATE_MODE_HIGH)
+                {
+                    /*
+                     * 当前合法枚举值为0～3。
+                     * request->payload[0]是uint8_t，
+                     * 不可能小于0，所以只检查是否超过HIGH。
+                     */
+                    status = CMD_STATUS_INVALID_PARAMETER;
+                }
+                else
+                {
+                    /*
+                     * 修改当前量程控制模式。
+                     * 如果设置LOW、MID或HIGH：
+                     *     Gate_Set_Mode()会进一步切换GATE GPIO，
+                     *     让硬件立即进入指定量程。
+                     * 如果设置AUTO：
+                     *     只恢复自动控制模式，
+                     *     后续由Process_ADC_Chunk()判断实际档位。
+                     * 这里不调用EEPROM_SysSetting_Save()，
+                     * 所以属于临时量程切换。
+                     * 官方Client做自动零点校准时，可以：
+                     * 切LOW → 采集LOW零点
+                     * 切MID → 采集MID零点
+                     * 切HIGH → 采集HIGH零点
+                     * 最后切回AUTO
+                     * 不会永久修改用户原有的量程设置。
+                     */
+                    Gate_Set_Mode(request->payload[0]);
+
+                    /*
+                     * 切换完成后，把软件模式和硬件实际档位回传。
+                     * 上位机不能只根据自己发送的值判断切换成功。
+                     */
+                    payload[0] = Gate_Get_Mode();
+                    payload[1] = Gate_get_status();
+
+                    payload_length = 2U;
+                }
+                
+
+                break;
+
+
+            case CMD_CAL_SET:
+                /*4.写入三档校准参数*/
+                /*6个float必须正好24字节，长度不是24，不能解析*/
+                if (request->payload_length != 24U)
+                {
+                    status = CMD_STATUS_INVALID_LENGTH;
+                }
+                else
+                {
+                    /*先读取当前正在使用的有效参数*/
+                     Sys_Get_AdcCalibration(&calibration);
+
+                    /*将下发数据帧中的payload的24字节 恢复 为6字节
+                    这一步只负载字节转换*/
+                    CmdStrategy_ReadCalibrationPayload(
+                        &calibration,
+                        request->payload);
+
+                    /*统一执行校验，RAM更新，EEPROM保存*/
+                    /*
+                     * 内部执行顺序：
+                     *
+                     * 1. 备份原校准参数；
+                     * 2. 检查新参数是否合法；
+                     * 3. 合法后更新RAM；
+                     * 4. 保存整份系统设置到EEPROM；
+                     * 5. EEPROM失败时恢复旧RAM参数。
+                     * 可能返回：
+                     * CMD_STATUS_OK
+                     * CMD_STATUS_INVALID_PARAMETER
+                     * CMD_STATUS_EEPROM_ERROR
+                     * */
+                    status = CmdStrategy_SaveCalibration(&calibration);
+
+                    if (status == CMD_STATUS_OK)
+                    {
+                        /* 注意：这里不是直接将 下发的数据 原样返回，而是保存成功后，再从系统中读取实际生效参数
+                        再传回给上位机，这样确保上位机收到的是设备实际真正保存的结果 */
+                        Sys_Get_AdcCalibration(&calibration);
+
+                        CmdStrategy_WriteCalibrationPayload(
+                            payload,
+                            &calibration);
+                        payload_length = 24;    
+                        
+                    }
+                    /*如果保存失败，有status记录原因，负载长度依旧为0*/
+
+                }
+                
+                break;
+
+            case CMD_CAL_RESET:
+                /*5.恢复默认出厂校准参数*/
+
+                /*
+                 * 恢复出厂校准属于会修改EEPROM的操作，
+                 * 因此要求上位机携带两个确认字节。
+                 */
+                if (request->payload_length != 2U)
+                {
+                    status = CMD_STATUS_INVALID_LENGTH;
+                }
+                else if (request->payload[0] != 0xC3U
+                         || request->payload[1] != 0x3CU)
+                {
+                    /* 确认码不正确时拒绝执行。*/
+                    status = CMD_STATUS_INVALID_PARAMETER;
+                }
+                else
+                {
+                    /*
+                     * 生成默认校准参数：
+                     * LOW增益  = 1.0
+                     * MID增益  = 1.0
+                     * HIGH增益 = 1.0
+                     * LOW偏移  = 0
+                     * MID偏移  = 0
+                     * HIGH偏移 = 0
+                     */
+                    ADC_Calibration_SetDefault(&calibration);
+
+                    /*
+                     * 默认参数同样需要：
+                     * 校验
+                     * → 更新RAM
+                     * → 写EEPROM
+                     * → 失败时恢复旧RAM
+                     */
+                    status =
+                        CmdStrategy_SaveCalibration(&calibration);
+
+                    if (status == CMD_STATUS_OK)
+                    {
+                        /*
+                         * 保存成功后重新读取实际结果，
+                         * 再把六个参数回传给官方Client。
+                         */
+                        Sys_Get_AdcCalibration(&calibration);
+
+                        CmdStrategy_WriteCalibrationPayload(
+                            payload,
+                            &calibration);
+
+                        payload_length = 24U;
+                    }
+                }
+
                 break;
 
             case CMD_FW_UPDATE:
+                /*6.请求进入bootloader升级模式*/
+
+                /*同上，先判断是否合法*/
                 if (request->payload_length != 2U)
                 {
                     status = CMD_STATUS_INVALID_LENGTH;
@@ -646,21 +1117,58 @@ static void CmdStrategy_Execute(
                 else
                 {
                     /*
-                     * 保持现有升级架构：
-                     * 这里只置位，由defaultTask中的
-                     * CmdStrategy_Process()延后执行复位。
-                     */
+                     * 保留当前复刻工程已经验证过的升级结构。
+                     * 此处不直接访问EEPROM、不直接卸载USB，
+                     * 也不直接执行NVIC_SystemReset()。
+                     * 这里只设置升级请求标志。
+                     * defaultTask后续调用CmdStrategy_Process()时，再统一完成整体升级步骤
+                     */       
                     s_update_pending = 1U;
+                     
                     return;
                 }
                 break;
 
-            default:
+        default:
+                /*
+                 * 命令号不属于当前协议支持范围。
+                 *
+                 * 不执行任何业务操作，
+                 * 最终只回复“不支持该命令”状态码。
+                 */
                 status = CMD_STATUS_UNSUPPORTED_COMMAND;
-                break;
+
+            break;
         }
+
     }
 
+    /*
+     * 除合法的固件升级请求以外，
+     * 所有命令最终都从这里统一生成回复。
+     *
+     * CmdStrategy_EncodeResponse()会完成：
+     *
+     * 1. 在业务payload前加入1字节status；
+     * 2. 将回复命令号设置为request->type | 0x80；
+     * 3. 原样带回请求序号request->sequence；
+     * 4. 写入payload长度；
+     * 5. 计算并追加CRC16；
+     * 6. 返回整帧有效长度。
+     *
+     * 成功读取校准参数时：
+     *
+     * status              1字节
+     * calibration payload 24字节
+     * 回复payload总长度   25字节
+     * 整帧总长度          10 + 25 = 35字节
+     *
+     * 命令执行失败时：
+     *
+     * payload_length = 0
+     * 回复payload只有1字节status
+     * 上位机可以根据status显示具体错误原因。
+     */
     response->length =
         CmdStrategy_EncodeResponse(
             request,
@@ -668,6 +1176,8 @@ static void CmdStrategy_Execute(
             payload,
             payload_length,
             response->data);
+
+            
 }
 
 /**
@@ -835,5 +1345,4 @@ void CmdStrategy_Process(void)
     
 
 }
-
 

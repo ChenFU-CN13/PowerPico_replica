@@ -93,6 +93,8 @@ extern FUSB302_dev_t fusb302_dev;
 extern App_PD_t app_pd;
 
 uint8_t fusb302_dev_init(void);
+void fusb302_i2c_diag_reset(void);
+void fusb302_session_reset(void);
 void handle_FUSB302_event(FUSB302_event_t events);
 bool is_power_ready(void);
 bool is_PPS_ready(void);

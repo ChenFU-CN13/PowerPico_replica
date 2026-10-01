@@ -24,6 +24,13 @@
 void KeyTask(void *argument)
 {
 	key_event_t key_event; // 保存 Key_Scan() 输出的按键编号和事件类型。
+	
+	while (User_Tasks_GetStatus()!=USER_TASKS_STATUS_READY)
+	{
+		osDelay(1);
+	}
+	
+	
 	while(1)
 	{
 		if(Key_Scan(&key_event)) // 返回 true 表示本轮产生了 DOWN、CLICK、LONG 等事件。

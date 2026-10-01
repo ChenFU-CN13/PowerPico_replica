@@ -8,6 +8,10 @@
 #include "user_HardwareInitTask.h"
 #include "user_TasksInit.h"
 #include "test.h"
+#include "key.h"
+#include "beep.h"
+#include "main.h"
+#include "fusb302_dev.h"
 // includes
 // sys
 
@@ -43,9 +47,15 @@
      * 要么s_step5_start_status已经记录失败状态。
      */
     Step6C_HardwareInit_Run();
-
-
-
+    /* 初始化五个物理按键，确保蜂鸣器默认关闭 */
+    Key_Init();
+    beep_close();
+    /*
+    * STEP9-1：
+    * 只初始化FUSB302，不连接外部CC，不进行PD协商。
+    */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);
+    (void)fusb302_dev_init();
     /*
      * 该标志表示HardwareInitTask已经执行完毕。
      * LCD上的BOK依靠这个状态产生。

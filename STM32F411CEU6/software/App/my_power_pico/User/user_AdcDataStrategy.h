@@ -30,9 +30,9 @@ extern "C" {
  * + 10组 × 7字节采样数据
  * = 81字节
  */
-#define USB_ADC_PACKET_SIZE      (11U + 7U * ADC_TIMES)
+#define USB_ADC_PACKET_SIZE      (11U + 7U * ADC_TIMES) //81字节
 
-#pragma pack(push, 1)
+#pragma pack(push, 1)       // 1字节对齐
 
 /**
  * @brief 一组USB波形采样点
@@ -56,7 +56,7 @@ typedef struct
     USB_ADC_Sample_T samples[ADC_TIMES];        // 10组采样点
 } USB_ADC_Packet_T;
 
-#pragma pack(pop)
+#pragma pack(pop)           // 恢复默认对齐方式
 
 /* 编译期检查结构体必须正好为81字节。 */
 typedef char USB_ADC_Packet_SizeCheck[
@@ -99,20 +99,20 @@ typedef char USB_ADC_Packet_SizeCheck[
  *
  * 1. ADC每变化1 LSB对应的电压：
  *
- *                Vref
- *   V_LSB = -------------
- *               N_ADC
+ *                Vref              3.0
+ *   V_LSB = ------------- =  ------------- ≈ 0.000732422 V
+ *               N_ADC              4096
  *
  * 2. 由于该电压经过INA190放大，因此采样电阻上的实际电压变化：
  *
- *                 V_LSB
- *   V_shunt = -------------
- *                   G
+ *                 V_LSB             0.000732422
+ *   V_shunt = ------------- =  ------------- ≈ 0.000014648 V
+ *                   G                   50
  *
  * 3. 根据欧姆定律 I = V / R，得到每LSB对应的电流：
  *
  *                 Vref
- *   I_LSB = -------------------
+ *   I_LSB = ---------------------
  *            N_ADC × G × Rshunt
  *
  * 4. 上式单位为 A/LSB，乘以10^6转换为 uA/LSB：
@@ -121,14 +121,19 @@ typedef char USB_ADC_Packet_SizeCheck[
  *   I_LSB(uA) = ------------------- × 10^6
  *               N_ADC × G × Rshunt
  * 
- * 注意：\ 符合在预定义中表示“这一行还没结束，下一行继续”，这个符号通常是用来规范代码形式的
+ * 注意：\ 符号在预定义中表示“这一行还没结束，下一行继续”，这个符号通常是用来规范代码形式的
  */
+
+//这三个宏定义是三档理论换算比例，单位都是 uA/LSB。
+//LOW档：
 #define SCALE_LOW_UA_PER_LSB  \
     (ADC_VREF_V / ADC_CODE_COUNT / INA190_GAIN / LOW_CUR_RES * 1000000.0f)
 
+//MID档：
 #define SCALE_MID_UA_PER_LSB  \
     (ADC_VREF_V / ADC_CODE_COUNT / INA190_GAIN / MID_CUR_RES * 1000000.0f)
 
+//HIGH档：
 #define SCALE_HIGH_UA_PER_LSB \
     (ADC_VREF_V / ADC_CODE_COUNT / INA190_GAIN / HIGH_CUR_RES * 1000000.0f)
 
@@ -201,7 +206,7 @@ typedef struct
 #define AUTO_RANGE_MID_DOWN_CODE        15U
 #define AUTO_RANGE_HIGH_DOWN_CODE       15U
 
-/* MID通道接近ADC上下电源轨时，强制按过载处理。 */
+/* MID通道接近ADC上下限时，强制按过载处理。 */
 #define AUTO_RANGE_MID_RAIL_MARGIN      15U
 
 /* 连续满足多少个采样点后，才允许换挡。 */
@@ -289,6 +294,28 @@ typedef struct
 }ADC_AutoRangeDebug_T;
 
 
+/*
+ * ADC采样率为10kHz。
+ * LCD每250ms更新一次平均值，对应约2500个采样点。
+ */
+#define DATA_MONITOR_SAMPLE_RATE_HZ      10000U
+#define DATA_MONITOR_PERIOD_MS           250U
+#define DATA_MONITOR_SAMPLE_COUNT        \
+    ((DATA_MONITOR_SAMPLE_RATE_HZ * DATA_MONITOR_PERIOD_MS) / 1000U)
+
+/**
+ * @brief 获取LCD使用的平均电压和平均电流
+ * @param out_voltage_v 平均电压，单位V
+ * @param out_current_ua 平均电流，单位uA
+ * @param out_range 最近一个有效采样点使用的量程
+ * @return true 已经产生第一组平均值
+ * @return false 尚未累计够一个统计窗口或参数错误
+ */
+bool Data_Monitor_GetValues(float *out_voltage_v,
+                            float *out_current_ua,
+                            uint8_t *out_range);
+
+
 
 /**
  * @brief 一个DMA半区的五通道平均原始值
@@ -341,29 +368,20 @@ float ADC_ConvertVoltage_V(uint16_t vol_raw);
 
 /**
  * @brief 将ADC原始值换算成经过校准后的电流
- *
  * @param current_adc_raw 当前量程下，电流检测通道的ADC原始值
  * @param ref_adc_raw     1.5V参考通道的ADC原始值
  * @param range           当前采样档位（LOW / MID / HIGH）
- *
  * @return 校准后的电流值，单位：uA
- *
  * @note
  * ============================================================
  * 整体计算流程：
- *
  *  ① 计算ADC差值
- *
  *      ΔADC = ADC_current - ADC_ref
- *
  *  ② ADC差值 → INA190输出端电压差
- *
  *                         Vref
  *      ΔV_INA = ΔADC × -----------
  *                        N_ADC
- *
  *  ③ 去除INA190增益，得到采样电阻两端的真实电压
- *
  *                   ΔV_INA
  *      V_shunt = ------------
  *                      G

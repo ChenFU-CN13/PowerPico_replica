@@ -938,7 +938,7 @@ void Step6C_HardwareInit_Run(void)
      * main()中已经提前把真实硬件切到HIGH安全档。
      * 这里切换的只是软件控制模式，不会立即改变当前硬件档位。
      */
-    Gate_Set_Mode(GATE_MODE_AUTO);
+    Gate_Set_Mode(Sys_Get_CurrentRangeMode());
 
     /*
      * 根据当前真实档位重新初始化自动量程状态、
@@ -1190,7 +1190,6 @@ void Step6E_Test_UpdateUsb(void)
 }
 
 /*************************************************************************************** */
-
 
 
 

@@ -57,7 +57,18 @@ void Sys_Get_AdcCalibration(
     ADC_Calibration_T *calibration);
 
 
+/* 系统显示设置 */
+bool Sys_Set_BacklightLevel(uint8_t level);         // 设置背光亮度
+bool Sys_Set_KeySoundEnable(bool enable);           // 设置按键音效
+bool Sys_Set_LanguageSelect(uint8_t language);      // 设置语言
+bool Sys_Set_Rotation(uint16_t rotation);           // 设置屏幕旋转角度
+bool Sys_Set_CurrentRangeMode(uint8_t mode);        // 设置当前工作模式
 
+uint8_t Sys_Get_BacklightLevel(void);               // 获取背光亮度
+bool Sys_Get_KeySoundEnable(void);                 // 获取按键音效
+uint8_t Sys_Get_LanguageSelect(void);               // 获取语言
+uint16_t Sys_Get_Rotation(void);                     // 获取屏幕旋转角度
+uint8_t Sys_Get_CurrentRangeMode(void);             // 获取当前工作模式
 
 
 #endif /* __BL24C02_H */
