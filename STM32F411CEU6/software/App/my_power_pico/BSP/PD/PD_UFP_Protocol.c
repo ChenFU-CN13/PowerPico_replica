@@ -551,7 +551,8 @@ bool PD_protocol_get_power_info(PD_protocol_t * p, uint8_t index, PD_power_info_
 {
     if (p && index < p->power_data_obj_count && power_info) {
         uint32_t obj = p->power_data_obj[index]; // 取出 Source_Capabilities 中对应的原始对象。
-        power_info->type = obj >> 30;            // 最高 2 位决定 Fixed/Battery/Variable/Augmented。
+        power_info->type =
+            (enum PD_power_data_obj_type_t)(obj >> 30); // 最高2位决定Fixed/Battery/Variable/Augmented。
         switch (power_info->type) {
         case PD_PDO_TYPE_FIXED_SUPPLY:
             /* Reference: 6.4.1.2.3 Source Fixed Supply Power Data Object */
@@ -614,8 +615,10 @@ bool PD_protocol_get_PPS_status(PD_protocol_t *p, PPS_status_t * PPS_status)
         /* Reference: 6.5.10 PPS_Status Message */
         PPS_status->output_voltage = ((uint16_t)p->PPSSDB[1] << 8) | p->PPSSDB[0];
         PPS_status->output_current = p->PPSSDB[2];
-        PPS_status->flag_PTF = (p->PPSSDB[3] >> 1) & 0x3;   /* Bit 1 ... 2 */
-        PPS_status->flag_OMF = (p->PPSSDB[3] >> 3) & 0x1;   /* Bit 3 */
+        PPS_status->flag_PTF =
+            (enum PPS_PTF_t)((p->PPSSDB[3] >> 1) & 0x3); /* Bit 1 ... 2 */
+        PPS_status->flag_OMF =
+            (enum PPS_OMF_t)((p->PPSSDB[3] >> 3) & 0x1); /* Bit 3 */
         return true;
     }
     return false;

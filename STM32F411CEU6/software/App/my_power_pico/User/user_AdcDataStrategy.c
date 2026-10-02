@@ -15,18 +15,6 @@ uint16_t adc_raw_buffer[ADC_DMA_ROWS][ADC_CHANNELS];
 
 
 /*
- * 保存ADC任务最近处理完成的数据块。
- * LCD或其他低优先级代码只读取这个稳定快照。
- */
-static uint16_t s_adc_snapshot[ADC_TIMES][ADC_CHANNELS];
-/*
- * 偶数表示快照稳定，奇数表示ADC任务正在复制。
- * 读取方前后检查序号，避免读到一半新、一半旧的数据。
- */
-static volatile uint32_t s_adc_snapshot_seq;
-static volatile bool s_adc_snapshot_valid;
-
-/*
  * 最近生成的一包USB波形数据。
  * 该缓存只在MessageSendTask上下文中产生和读取，不由ADC中断访问。
  */
@@ -51,10 +39,9 @@ static ADC_BlockSlot_T s_adc_block_queue[ADC_BLOCK_QUEUE_DEPTH];
 static volatile uint8_t s_adc_block_write_index;
 static volatile uint8_t s_adc_block_read_index;
 static volatile uint32_t s_adc_block_sequence;
-static volatile uint32_t s_adc_block_drop_count;
-static uint32_t s_adc_block_drop_seen;
 static uint32_t s_adc_error_seen;
 static uint32_t s_adc_last_processed_sequence;
+static volatile uint32_t s_adc_error_count;
 
 /*ADC采集启动标志*/
 static bool s_adc_sampling_started;
@@ -66,18 +53,6 @@ static uint8_t s_auto_down_count;
 /* 切档后的数据丢弃和冷却计数。 */
 static uint8_t s_auto_skip_chunks;
 static uint8_t s_auto_cooldown_chunks;
-
-/* 提供给STEP5 LCD页面观察的数据。 */
-static ADC_AutoRangeDebug_T s_auto_debug;
-
-/* 奇数表示ADC任务正在更新调试数据，偶数表示数据稳定。 */
-static volatile uint32_t s_auto_debug_seq;
-
-
-/* 只用于STEP3调试观察。 */
-volatile uint32_t adc_half_count;
-volatile uint32_t adc_full_count;
-volatile uint32_t adc_error_count;
 
 /**
  * @brief LCD显示数据统计结构
@@ -116,26 +91,6 @@ static uint16_t ADC_AbsDiffU16(uint16_t a,uint16_t b)
         return a-b;
     }
     return b-a;
-}
-
-/**
- * @brief 进入调试结构体写入阶段
- * @note 序号变成奇数后，LCD任务会等待本次更新完成
- */
-static void ADC_AutoRange_DebugWriteBegin(void)
-{
-    s_auto_debug_seq++;
-    __DMB();
-}
-
-/**
- * @brief 结束调试结构体写入阶段
- * @note 先保证数据写完，再把序号恢复成偶数
- */
-static void ADC_AutoRange_DebugWriteEnd(void)
-{
-    __DMB();
-    s_auto_debug_seq++;
 }
 
 /**
@@ -252,42 +207,14 @@ static void ADC_AutoRange_ClearConfirmCount(void)
 
 
 /**
- * @brief 同步内部计数到调试结构体
- */
-static void ADC_AutoRange_UpdateDebugCount(void)
-{
-    s_auto_debug.up_count = s_auto_up_count;
-    s_auto_debug.down_count = s_auto_down_count;
-    s_auto_debug.skip_chunks = s_auto_skip_chunks;
-    s_auto_debug.cooldown_chunks = s_auto_cooldown_chunks;
-}
-
-
-/**
  * @brief 复位自动量程算法
  */
 void ADC_AutoRange_Reset(void)
 {
-    ADC_AutoRange_DebugWriteBegin();
-
-    memset(&s_auto_debug,0,sizeof(s_auto_debug));
-
     ADC_AutoRange_ClearConfirmCount();
     /*初始化计数值*/
     s_auto_skip_chunks = 0;
     s_auto_cooldown_chunks = 0;
-    /*初始化状态*/
-    s_auto_debug.state = ADC_RANGE_STATE_HOLD;
-    s_auto_debug.current_range = Gate_get_status();
-    s_auto_debug.sample_range = Gate_get_status();
-    s_auto_debug.request_range = Gate_get_status();
-    /*由于将自动测量复位，所以全部状态回归初始*/
-    s_auto_debug.last_from = Gate_get_status();
-    s_auto_debug.last_to = Gate_get_status();
-    s_auto_debug.last_reason = ADC_SWITCH_REASON_NONE;
-
-    ADC_AutoRange_UpdateDebugCount();
-    ADC_AutoRange_DebugWriteEnd();
 }
 
 
@@ -546,10 +473,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
     uint16_t ref_adc_raw;       //参考通道原始ADC值
     uint16_t abs_delta_adc_raw; //绝对差值
     bool mid_near_rail;         //是否在中档位附近
-    int32_t delta_adc_raw;      //差值
-
-    /*1.先保持默认档位，保持默认事件和判空*/
-    ADC_SwitchReason_T  switch_reason = ADC_SWITCH_REASON_NONE;
 
     if (chunk_ptr == NULL)
     {
@@ -557,15 +480,10 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
         return false;
     }
 
-    ADC_AutoRange_DebugWriteBegin();    //开始写入调试数据
-
     /*先保持当前档位*/
     gate_mode = Gate_Get_Mode();
     current_range = Gate_get_status();
     request_range = current_range;
-    /*未经以下处理的，先保持当前档位，避免后续判断错误*/
-    s_auto_debug.current_range = current_range;
-    s_auto_debug.request_range = request_range;
 
     /*
      * 刚切档后的下一整块数据不可信。
@@ -576,12 +494,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
     if (s_auto_skip_chunks > 0)
     {
         s_auto_skip_chunks--;
-
-        s_auto_debug.state = ADC_RANGE_STATE_SKIP;
-        s_auto_debug.skipped_block_count++;
-
-        ADC_AutoRange_UpdateDebugCount();    //更新调试数据计数
-        ADC_AutoRange_DebugWriteEnd();      //结束写入调试数据
         return false;                       //返回false，表示本块数据不可信，退出函数
     }
     
@@ -607,19 +519,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
      */
     decision_enabled  = (gate_mode == GATE_MODE_AUTO) && (s_auto_cooldown_chunks==0);//要满足门状态和冷却计算=0
 
-    if (decision_enabled)
-    {   /*说明当前是自动模式，且冷却结束*/
-        s_auto_debug.state = ADC_RANGE_STATE_HOLD;//保持
-    }
-    else if (s_auto_cooldown_chunks > 0)
-    {   /*说明当前是自动模式，且冷却中*/
-        s_auto_debug.state = ADC_RANGE_STATE_COOL;//冷却
-    }
-    else
-    {   /*说明当前是手动模式*/
-        s_auto_debug.state = ADC_RANGE_STATE_HOLD;//保持
-    }
-
     /*
      * 一个DMA半区有10组采样。
      * 连续确认使用的是“连续采样点”，不是LCD刷新次数。
@@ -641,23 +540,8 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
         /*获取参考通道原始ADC值*/
         ref_adc_raw = sample_row[IDX_REF];
 
-        /*
-         * 先转成有符号32位整数再相减。
-         * 这样2043-2048会得到-5，不会发生无符号下溢。
-         */
-        delta_adc_raw =
-            (int32_t)current_adc_raw -
-            (int32_t)ref_adc_raw;
-
         abs_delta_adc_raw =
             ADC_AbsDiffU16(current_adc_raw, ref_adc_raw);
-        /* 保存最近处理的一个采样点，供LCD观察。 */
-        s_auto_debug.valid = true;
-        s_auto_debug.sample_range = current_range;
-        s_auto_debug.current_adc_raw = current_adc_raw;
-        s_auto_debug.delta_adc_raw = delta_adc_raw;
-        s_auto_debug.ref_adc_raw = ref_adc_raw;
-        s_auto_debug.abs_delta_adc_raw = abs_delta_adc_raw;
 
         /*
         * 只有通过切档稳定期检查的有效数据才参与LCD平均。
@@ -698,12 +582,9 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
                         s_auto_up_count++;
                     }
 
-                    s_auto_debug.state = ADC_RANGE_STATE_UP_WAIT;//同时标记为待升档状态
-
                     if (s_auto_up_count >= AUTO_RANGE_UP_CONFIRM_TIMES)
                     {   /*如果计数条件已经满足，则准备升档*/
                         request_range = MID_CUR;                //标记期望升档的档位  
-                        switch_reason = ADC_SWITCH_REASON_OVERLOAD;//标记升档原因
                     }
                 }
                 else
@@ -713,7 +594,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
                      * 连续确认链条就要清零，重新开始计数。
                      */
                     s_auto_up_count = 0U;
-                    s_auto_debug.state = ADC_RANGE_STATE_HOLD;//标记为保持状态
                 }
 
                 break;
@@ -746,22 +626,10 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
                     {
                          s_auto_up_count++; //小于条件则继续++
                     }
-                    s_auto_debug.state = ADC_RANGE_STATE_UP_WAIT;//并同时标记状态为待升档
-                    
                     if (s_auto_up_count>=AUTO_RANGE_UP_CONFIRM_TIMES)
                     {
                         /*如果满足升档条件*/
                         request_range = HIGH_CUR;//标记期望升档档位
-
-                        if (mid_near_rail)
-                        {
-                            switch_reason = ADC_SWITCH_REASON_NEAR_RAIL;//标记切档原因为逼近ADC最大值
-                        }
-                        else
-                        {
-                            switch_reason = ADC_SWITCH_REASON_OVERLOAD;//标记原因为过负载
-                        }
-                        
                     }
                     
                 }
@@ -777,13 +645,10 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
                         s_auto_down_count++;//继续++
                     }
                     
-                    s_auto_debug.state = ADC_RANGE_STATE_DOWN_WAIT;//标记为待降档状态
-
                     if (s_auto_down_count >= AUTO_RANGE_DOWN_CONFIRM_TIMES)
                     {
                         /* 如果降档计数达到，那么标记期望切档模式 */
                         request_range = LOW_CUR;
-                        switch_reason = ADC_SWITCH_REASON_UNDERLOAD;//标记切档原因为负载电流减小，切换高精度单位测量
                     }
                     
 
@@ -797,7 +662,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
                      * 那么就停在保持区，不升档也不降档。
                      */
                     ADC_AutoRange_ClearConfirmCount();
-                    s_auto_debug.state = ADC_RANGE_STATE_HOLD;
                 }
 
 
@@ -825,20 +689,16 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
                         s_auto_down_count++;
                     }
 
-                    s_auto_debug.state =ADC_RANGE_STATE_DOWN_WAIT;//并标记为待降档状态
-
                     /*如果降档次数达标，则标记期望切档档位，并标记切档原因是负载电流减小，切换高精度单位测量*/
                     if (s_auto_down_count >=AUTO_RANGE_DOWN_CONFIRM_TIMES)
                     {
                         request_range = MID_CUR;
-                        switch_reason = ADC_SWITCH_REASON_UNDERLOAD;
                     }
                 }
                 else
                 {
                     /*如果中途出现电流ADC值小于降档阈值，则取消连续计数并归0，状态标记为保持*/
                     s_auto_down_count = 0U;
-                    s_auto_debug.state = ADC_RANGE_STATE_HOLD;
                 }
                 
 
@@ -852,7 +712,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
                  * 未知负载优先使用最大量程，避免大电流经过50Ω采样电阻。
                  */
                 request_range = HIGH_CUR;
-                switch_reason = ADC_SWITCH_REASON_RANGE_ERROR;
                 break;
             }
     }   /* switch (current_range) 换挡判断结束 */
@@ -880,27 +739,7 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
     if ((gate_mode==GATE_MODE_AUTO) && (request_range != current_range))
     {
         /*如果门状态为自动 并且 期望档位≠当前档位*/
-        uint8_t confirm_count;
-
-        if ((switch_reason == ADC_SWITCH_REASON_OVERLOAD) || (switch_reason == ADC_SWITCH_REASON_NEAR_RAIL))
-        {
-            /* 如果切档原因为负载过大 或者 采集ADC值逼近ADC最大值 */
-            confirm_count = s_auto_up_count;    //则提取升档计数值
-        }
-        else
-        {
-            /* 否则就提取降档计数值 */
-            confirm_count = s_auto_down_count;
-        }
-        
         flow_route_selection(request_range);    //真正切换电路测量档位，改GPIO设置
-
-        /*以下则记录今次换挡原因和换挡前的各项设置，用于调试对比*/
-        s_auto_debug.last_from = current_range;
-        s_auto_debug.last_to = request_range;
-        s_auto_debug.last_reason = switch_reason;
-        s_auto_debug.last_confirm_count = confirm_count;    //这里应该是换挡次数
-        s_auto_debug.switch_count++;                        //累计换挡次数？
 
         /*
          * 下一块直接丢弃。因为下快数据是旧档位测量得到的
@@ -909,11 +748,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
         s_auto_skip_chunks = AUTO_RANGE_SKIP_CHUNKS;//标记丢弃下一个数据
         s_auto_cooldown_chunks = AUTO_RANGE_COOLDOWN_CHUNKS;//标记冷却5个数据期
         ADC_AutoRange_ClearConfirmCount();  //清空两个计数器
-        /*提取给LCD*/
-        s_auto_debug.state = ADC_RANGE_STATE_SWITCH;
-        s_auto_debug.current_range = request_range;
-        s_auto_debug.request_range = request_range;
-        
     }
         else if (s_auto_cooldown_chunks > 0U)
     {
@@ -922,12 +756,7 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
          * 每正常处理完一块，冷却计数减1。
          */
         s_auto_cooldown_chunks--;
-        s_auto_debug.cooldown_block_count++;
-        s_auto_debug.state = ADC_RANGE_STATE_COOL;
     }
-
-    ADC_AutoRange_UpdateDebugCount();
-    ADC_AutoRange_DebugWriteEnd();
 
     return true;
 
@@ -938,46 +767,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
 
 }
 
-/**
- * @brief 获取自动量程调试数据
- */
-bool ADC_AutoRange_GetDebug(ADC_AutoRangeDebug_T *debug)
-{
-    uint32_t seq_begin;
-    uint32_t seq_end;
-
-    if (debug == NULL)
-    {
-        return false;
-    }
-
-    /*
-     * ADC任务可能在LCD读取过程中更新结构体。
-     * 前后序号一致且为偶数，才说明这份副本来自同一次完整更新。
-     */
-    for (;;)
-    {
-        seq_begin = s_auto_debug_seq;
-
-        if ((seq_begin & 1U) != 0U)
-        {
-            continue;
-        }
-
-        __DMB();
-        *debug = s_auto_debug;
-        __DMB();
-
-        seq_end = s_auto_debug_seq;
-
-        if ((seq_begin == seq_end) && ((seq_end & 1U) == 0U))
-        {
-            break;
-        }
-    }
-
-    return debug->valid;
-}
 
 
 
@@ -1004,13 +793,7 @@ HAL_StatusTypeDef ADC_Sampling_Start(void)
     
     /*2.清空缓冲区*/
     memset(adc_raw_buffer,0,sizeof(adc_raw_buffer));
-    adc_half_count=0;
-    adc_full_count=0;
-    adc_error_count=0;
-
-    memset(s_adc_snapshot, 0, sizeof(s_adc_snapshot));
-    s_adc_snapshot_seq = 0U;
-    s_adc_snapshot_valid = false;
+    s_adc_error_count = 0U;
     /* 新一轮ADC采样不能沿用上一次LCD平均值。 */
     Data_Monitor_Clear();
 
@@ -1018,8 +801,6 @@ HAL_StatusTypeDef ADC_Sampling_Start(void)
     s_adc_block_write_index = 0U;
     s_adc_block_read_index = 0U;
     s_adc_block_sequence = 0U;
-    s_adc_block_drop_count = 0U;
-    s_adc_block_drop_seen = 0U;
     s_adc_error_seen = 0U;
     s_adc_last_processed_sequence = 0U;
 
@@ -1069,125 +850,6 @@ void ADC_Sampling_Stop(void)
     HAL_ADC_Stop_DMA(&hadc1);
     s_adc_sampling_started=false;
 }
-
-/**
- * @brief 获取最近一个完整DMA半区的五通道平均值
- * @param average 用于保存平均结果
- * @return true 获取成功
- * @return false 参数错误或还没有有效快照
- */
-bool ADC_GetRawAverage(ADC_RawAverage_T *average)
-{
-    uint16_t local_snapshot[ADC_TIMES][ADC_CHANNELS];       //局部副本，避免ADC任务在读取中途更新全局快照
-    uint32_t sum[ADC_CHANNELS] = {0U};                      //分别将5通道的ADC值进行累加，用一个数组存储起来
-    uint32_t seq_begin;                                     //seq_begin，seq_end用来判断复制期间，中断有没有修改全局快照
-    uint32_t seq_end;   
-    uint32_t row;                                           //两个循环下标row，channel。
-    uint32_t channel;
-
-    /*1.先判断是否合法，避免空指针；保证在ISR后完成了更新*/
-    if (average == NULL || !s_adc_snapshot_valid)
-    {
-        return false;
-    }    
-    /*
-     * 这个do while循环的目的是，将备份提取出来，复制到这个函数的局部备份（也就是快照）
-     * 每次先判断ADC任务是否正在更新，如果不是，才提取数据
-     * 如果正在更新则直接跳过本轮（即continue）
-     * 
-     * 当提取完数据后，用seq_end再获取一次是否是处于ISR更新数据状态，
-     * 再进入一次while的判断，目的是判断当前数据是否是被ISR中途修改过的
-     * 也就是避免后半段是新数据、前半段还是旧数据
-     * 如果是这样的数据非法，那就是不可用的，直接再进入一轮while循环重新提取快照
-     * 如果不是非法数据，那就停止do while循环，那就进入下一步分别累加各个通道ADC值
-     */
-    for (;;)
-    {
-        seq_begin = s_adc_snapshot_seq;
-
-        /* 奇数表示ADC任务正在更新快照，稍后重新读取。 */
-        if ((seq_begin & 1U) != 0U)
-        {
-            continue;
-        }
-
-        /*
-        * DMB只保证内存访问顺序，不会禁止任务切换。
-        * 是否发生并发修改，由前后两次序号负责判断。
-        */
-        __DMB();
-
-        memcpy(local_snapshot,
-            s_adc_snapshot,
-            sizeof(local_snapshot));
-
-        __DMB();
-
-        seq_end = s_adc_snapshot_seq;
-
-        /* 序号前后一致且为偶数，说明本地副本完整。 */
-        if ((seq_begin == seq_end) &&
-            ((seq_end & 1U) == 0U))
-        {
-            break;
-        }
-    }
-
-    /*3.分别累加5通道的ADC值，用一个数组存储起来*/
-    for ( row = 0; row < ADC_TIMES; row++)
-    {
-        for ( channel = 0; channel < ADC_CHANNELS; channel++)
-        {
-            sum[channel] += local_snapshot[row][channel];
-        }
-        
-    }
-    
-    /*4.这里是求平均值：
-    按正常来说平均值=SUM/10，但是由于C语言整除会丢小数(这里是整数，所以最后一位是小数)，所以ADC_TIMES/2=5
-    即sum+5，用来保证四舍五入,列如：
-    10次采样总和 = 20486
-    不加5：
-    20486 ÷ 10 = 2048
-
-    加5：
-    (20486 + 5) ÷ 10
-    = 20491 ÷ 10
-    = 2049
-    精度不一样
-    */
-    average->vol_raw = (uint16_t)((sum[IDX_VOL] + ADC_TIMES/2) / ADC_TIMES);
-    average->low_raw = (uint16_t)((sum[IDX_LOW] + ADC_TIMES/2) / ADC_TIMES);
-    average->mid_raw = (uint16_t)((sum[IDX_MID] + ADC_TIMES/2) / ADC_TIMES);
-    average->high_raw = (uint16_t)((sum[IDX_HIGH] + ADC_TIMES/2) / ADC_TIMES);
-    average->ref_raw = (uint16_t)((sum[IDX_REF] + ADC_TIMES/2) / ADC_TIMES);
-
-    return true;
-
-}
-
-/**
- * @brief 把电压通道ADC值换算成VBUS电压
- * @param vol_raw 电压通道平均原始值
- * @return VBUS电压，单位V
- */
-float ADC_ConvertVoltage_V(uint16_t vol_raw)
-{
-    float adc_voltage_v;
-    float vbus_voltage_v;
-
-    /* ADC原始值换算成VADC引脚电压。 */
-    adc_voltage_v = (float)vol_raw
-                    * ADC_VREF_V
-                    / ADC_MAX_CODE;
-
-    /* 恢复被电阻网络缩小11倍之前的VBUS电压。 */
-    vbus_voltage_v = adc_voltage_v
-                     * VBUS_DIVIDER_GAIN;
-
-    return vbus_voltage_v;
-}
-
 
 /**
  * @brief 把ADC差值换算成带校准的电流
@@ -1364,26 +1026,6 @@ float ADC_ConvertCurrent_uA(
 
 
 /**
- * @brief 发布ADC任务已经处理到的最新数据块快照
- * @param source 队列中当前数据块的首地址
- * @note 这里只在ADC处理任务中调用，不直接读取DMA活动半区
- */
-static void ADC_PublishSnapshot(const uint16_t* source)
-{
-    /*1.变成奇数，表示在更新数据*/
-    s_adc_snapshot_seq++;
-    __DMB();
-
-    /*2.复制数据*/
-    memcpy(s_adc_snapshot,source,sizeof(s_adc_snapshot));
-    __DMB();
-
-    /*3.奇数+1变成偶数，表示更新完成*/
-    s_adc_snapshot_seq++;
-    s_adc_snapshot_valid = true;
-}
-
-/**
  * @brief 计算环形队列的下一个槽位
  */
 static uint8_t ADC_BlockQueue_NextIndex(uint8_t index)
@@ -1401,7 +1043,7 @@ static uint8_t ADC_BlockQueue_NextIndex(uint8_t index)
 /**
  * @brief 在ADC中断中发布一块完整数据
  * @param source 已完成DMA半区的首地址
- * @note 队列满时丢弃最新块并累计计数，绝不覆盖任务尚未处理的数据
+ * @note 队列满时丢弃最新块，序号断点会让任务识别丢块
  */
 static void ADC_BlockQueue_PublishFromISR(const uint16_t *source)
 {
@@ -1417,7 +1059,6 @@ static void ADC_BlockQueue_PublishFromISR(const uint16_t *source)
 
     if (next_index == s_adc_block_read_index)       //如果下一个写指针等于读指针，说明队列已满
     {
-        s_adc_block_drop_count++;                   //丢弃最新块并累计计数
         return;
     }
 
@@ -1439,27 +1080,14 @@ uint32_t ADC_ProcessPendingBlocks(void)
 {
     uint8_t read_index;
     uint32_t processed_count;
-    uint32_t drop_count;
     uint32_t error_count;
     uint32_t block_sequence;
-    uint32_t error_discard_count;
     uint8_t published_write_index;
     ADC_BlockSlot_T *slot;
     bool block_valid;
 
     processed_count = 0U;
-    drop_count = s_adc_block_drop_count;
-    error_count = adc_error_count;
-
-    /* 队列满导致的丢块单独累计，方便LCD直接观察任务是否跟得上。 */
-    if (drop_count != s_adc_block_drop_seen)
-    {
-        ADC_AutoRange_DebugWriteBegin();
-        s_auto_debug.lost_block_count +=
-            (uint32_t)(drop_count - s_adc_block_drop_seen);
-        ADC_AutoRange_DebugWriteEnd();
-        s_adc_block_drop_seen = drop_count;
-    }
+    error_count = s_adc_error_count;
 
     /* ADC硬件报错后取消连续确认，避免把错误前后的数据拼成一次换挡。 */
     if (error_count != s_adc_error_seen)
@@ -1470,23 +1098,15 @@ uint32_t ADC_ProcessPendingBlocks(void)
          * 错误发生前后数据的连续性已经无法保证。
          * 丢掉此刻已经排队的块，防止把错误两侧的采样拼成一次连续确认。
          */
-        error_discard_count = 0U;       //错误丢弃的块数量清0
         published_write_index = s_adc_block_write_index;    //获取当前写指针
 
         while (s_adc_block_read_index != published_write_index)
         {   /* 当读指针不等于写指针时，说明队列中还有数据 */
             s_adc_block_read_index =
                 ADC_BlockQueue_NextIndex(s_adc_block_read_index);
-            error_discard_count++;
         }
 
         s_adc_last_processed_sequence = 0U;
-
-        ADC_AutoRange_DebugWriteBegin();
-        s_auto_debug.state = ADC_RANGE_STATE_HOLD;              //设置状态为保持
-        s_auto_debug.lost_block_count += error_discard_count;    //累计丢弃的块数量
-        ADC_AutoRange_UpdateDebugCount();
-        ADC_AutoRange_DebugWriteEnd();
 
         s_adc_error_seen = error_count;
     }
@@ -1520,18 +1140,11 @@ uint32_t ADC_ProcessPendingBlocks(void)
          */
         if (slot->sample_range != Gate_get_status())
         {
-            ADC_AutoRange_DebugWriteBegin();
-            s_auto_debug.lost_block_count++;
-            ADC_AutoRange_DebugWriteEnd();
-
             s_adc_last_processed_sequence = block_sequence;
             __DMB();
             s_adc_block_read_index = ADC_BlockQueue_NextIndex(read_index);
             continue;
         }
-
-        /* 快照和自动换挡都只在ADC任务中更新，不再读取DMA正在改写的原缓冲区。 */
-        ADC_PublishSnapshot(&slot->samples[0][0]);
 
         block_valid =
             Process_ADC_Chunk(&slot->samples[0][0]);
@@ -1572,7 +1185,7 @@ uint32_t ADC_ProcessPendingBlocks(void)
 /**
  * @brief ADC DMA前半区填满回调(套用的是ADC半传输回调函数)
  * @param hadc ADC句柄
- * @note  当前只做计数，不能在中断中显示LCD、打印或执行复杂计算。
+ * @note  中断中只复制完整数据块并通知任务，不执行换挡、显示或打印。
  */
  void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
@@ -1580,7 +1193,6 @@ uint32_t ADC_ProcessPendingBlocks(void)
     {
         return;
     }
-    adc_half_count++;
     ADC_BlockQueue_PublishFromISR(&adc_raw_buffer[0][0]);
 
 
@@ -1603,7 +1215,7 @@ uint32_t ADC_ProcessPendingBlocks(void)
 /**
  * @brief ADC DMA后半区填满回调(套用的是ADC的全传输回调函数)
  * @param hadc ADC句柄
- * @note  当前只做计数，不能在中断中显示LCD、打印或执行复杂计算。
+ * @note  中断中只复制完整数据块并通知任务，不执行换挡、显示或打印。
  */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
@@ -1612,7 +1224,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
         return;
     }
 
-    adc_full_count++;
     /* 10～19行已经写完，此时DMA已经回到前半区。 */
     ADC_BlockQueue_PublishFromISR(&adc_raw_buffer[ADC_TIMES][0]);
 
@@ -1636,7 +1247,7 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
         return;
     }
 
-    adc_error_count++;
+    s_adc_error_count++;
 
     if (MessageSendTaskHandle != NULL)
     {

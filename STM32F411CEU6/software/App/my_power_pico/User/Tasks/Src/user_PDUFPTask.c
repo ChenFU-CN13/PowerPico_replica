@@ -102,7 +102,7 @@ void PDUFPTask(void *argument)
         fusb302_session_reset();  // 清掉旧连接方向、等待标志、PDO和消息ID。
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET); // 拉高 CC_EN，把外部 CC 连接到 FUSB302。
         PD_protocol_set_power_option(&app_pd.protocol, PD_POWER_OPTION_MAX_5V); // 固定档默认不超过 5 V。
-        PD_protocol_set_PPS(&app_pd.protocol, PPS_V(5.0), PPS_A(1.0), false);   // 同时准备 PPS 5 V/1 A 请求值。
+        PD_protocol_set_PPS(&app_pd.protocol, PPS_V(5.0f), PPS_A(1.0f), false); // 同时准备PPS 5V/1A请求值。
         // send_power_request();
         _pd_working_status = 1;                   // 从此开始执行底部的 FUSB302 轮询。
         (void)osTimerStart(PD_UFP_Task_timer_id, 1000); // 每1000 tick检查一次结果。
@@ -119,7 +119,7 @@ void PDUFPTask(void *argument)
 
       } else if(_pd_working_status && ui_msg.event == PD_CMD_SET_PPS) {
         // 设置PPS电压电流
-        if(ui_msg.pps_set_voltage > 0 && ui_msg.pps_set_current > 0 && ui_msg.pps_set_voltage <= 20.0 && ui_msg.pps_set_current <= 5.0) {
+        if(ui_msg.pps_set_voltage > 0 && ui_msg.pps_set_current > 0 && ui_msg.pps_set_voltage <= 20.0f && ui_msg.pps_set_current <= 5.0f) {
           PD_protocol_set_PPS(&app_pd.protocol, PPS_V(ui_msg.pps_set_voltage), PPS_A(ui_msg.pps_set_current), false); // 转为协议单位并重选 APDO。
           send_power_request(); // 只置发送标志，真正组 Request 并发包在 fusb302_timer() 中完成。
         }

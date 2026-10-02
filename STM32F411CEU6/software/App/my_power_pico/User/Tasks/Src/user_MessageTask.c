@@ -74,31 +74,6 @@
 #endif
 
 
-/* Private variables ---------------------------------------------------------*/
-/*
- * STEP6E USB接收链路计数。
- *
- * received/dropped在USB中断上下文更新，processed在接收任务更新。
- * Cortex-M4对对齐的32位变量可原子读写，LCD这里只做观察，不要求三个值
- * 必须来自完全相同的时刻，因此不额外关中断。
- */
-static volatile uint32_t s_rx_received_chunks;
-static volatile uint32_t s_rx_processed_chunks;
-static volatile uint32_t s_rx_dropped_chunks;
-
-/*
- * STEP7 USB发送链路计数，可直接加入Keil Watch窗口观察。
- * sent：已经交给USB驱动的波形包数量；
- * replace：来不及发送而被更新包替换的数量；
- * busy/fail：CDC_Transmit_FS返回忙或失败的次数。
- */
-volatile uint32_t g_step7_wave_sent_count;
-volatile uint32_t g_step7_wave_replace_count;
-volatile uint32_t g_step7_usb_busy_count;
-volatile uint32_t g_step7_usb_fail_count;
-
-
-
 /* Tasks ---------------------------------------------------------------------*/
 
 /**
@@ -140,7 +115,6 @@ bool MessageReceive_EnqueueFromISR(const uint8_t *data,
         || length > CMD_RX_CHUNK_SIZE
         || CmdRxQueue == NULL)
     {
-        s_rx_dropped_chunks++;
         return false;
     }
 
@@ -162,27 +136,10 @@ bool MessageReceive_EnqueueFromISR(const uint8_t *data,
                           0U,
                           0U) != osOK)
     {
-        s_rx_dropped_chunks++;
         return false;
     }
 
-    s_rx_received_chunks++;
     return true;
-}
-
-/**
- * @brief 读取USB接收链路调试计数
- */
-void MessageReceive_GetDebug(MessageRxDebug_T *debug)
-{
-    if (debug == NULL)
-    {
-        return;
-    }
-
-    debug->received_chunks = s_rx_received_chunks;
-    debug->processed_chunks = s_rx_processed_chunks;
-    debug->dropped_chunks = s_rx_dropped_chunks;
 }
 
 /**
@@ -231,7 +188,6 @@ void MessageReceiveTask(void *argument)
          * 仍由defaultTask中的CmdStrategy_Process()执行。
          */
         CmdStrategy_ProcessRx(chunk.data, chunk.length);
-        s_rx_processed_chunks++;
     }
 }
 
@@ -429,26 +385,10 @@ void MessageSendTask(void *argument)
                         STEP7_WAVE_PACKET_DIV;
 
                     /*
-                     * 全速模式下，如果一次处理出了多包，
-                     * 只能保留最新包，记录中间被覆盖的数量。
-                     */
-                    if ((STEP7_WAVE_PACKET_DIV == 1U)
-                        && (new_wave_count > 1U))
-                    {
-                        g_step7_wave_replace_count +=
-                            new_wave_count - 1U;
-                    }
-
-                    /*
                      * pending_adc还没有发出时又有新包，
                      * 直接使用最新包覆盖旧包。
                      * 实时波形优先保证“新”，旧数据不继续积压。
                      */
-                    if (adc_pending)
-                    {
-                        g_step7_wave_replace_count++;
-                    }
-
                     if (ADC_GetLatestUsbPacket(
                             &pending_adc,
                             NULL))
@@ -560,7 +500,6 @@ void MessageSendTask(void *argument)
             else
             {
                 adc_pending = false;
-                g_step7_wave_sent_count++;
             }
         }
         else
@@ -570,17 +509,6 @@ void MessageSendTask(void *argument)
              * 保留pending数据，1ms后继续重试。
              */
             usb_tx_active = false;
-
-            if (usb_tx_result == USBD_BUSY)
-            {
-                g_step7_usb_busy_count++;
-            }
-            else
-            {
-                g_step7_usb_fail_count++;
-            }
         }
     }
 }
-
-

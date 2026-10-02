@@ -30,8 +30,8 @@
 #define PD_A(a)     ((uint16_t)(a * 100 + 0.01))
 
 /* For use in PD_protocol_set_PPS_option() */
-#define PPS_V(v)    ((uint16_t)(v * 50 + 0.01))
-#define PPS_A(a)    ((uint8_t)(a * 20 + 0.01))
+#define PPS_V(v)    ((uint16_t)((v) * 50.0f + 0.01f))
+#define PPS_A(a)    ((uint8_t)((a) * 20.0f + 0.01f))
 
 #define PD_PROTOCOL_MAX_NUM_OF_PDO      7
 

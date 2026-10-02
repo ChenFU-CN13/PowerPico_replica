@@ -9,20 +9,6 @@ extern "C" {
 #include <stdint.h>
 
 /**
- * @brief STEP6E USB接收链路调试信息
- *
- * received_chunks：USB回调成功放入CmdRxQueue的数据块数量。
- * processed_chunks：MessageReceiveTask已经取出并解析的数据块数量。
- * dropped_chunks：队列未创建、数据超长或队列已满造成的丢包数量。
- */
-typedef struct
-{
-    uint32_t received_chunks;
-    uint32_t processed_chunks;
-    uint32_t dropped_chunks;
-} MessageRxDebug_T;
-
-/**
  * @brief 处理ADC数据并向PowerDataQueue发布最新测量结果
  * @param argument 未使用
  */
@@ -55,12 +41,6 @@ bool MessageReceive_EnqueueFromISR(const uint8_t *data,
  * 不能等待、延时、拼包或继续发送下一帧。
  */
 void MessageSend_NotifyTxCompleteFromISR(void);
-
-/**
- * @brief 读取STEP6E USB接收链路调试计数
- * @param debug 调试信息输出地址
- */
-void MessageReceive_GetDebug(MessageRxDebug_T *debug);
 
 #ifdef __cplusplus
 }

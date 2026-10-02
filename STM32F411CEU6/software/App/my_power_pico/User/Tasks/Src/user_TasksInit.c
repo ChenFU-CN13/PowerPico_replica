@@ -311,11 +311,3 @@ UserTasksStatus_T User_Tasks_GetStatus(void)
 
     return USER_TASKS_STATUS_READY;
 }
-
-/**
- * @brief 获取创建失败位图
- */
-uint32_t User_Tasks_GetErrorMask(void)
-{
-    return s_create_error_mask;
-}
