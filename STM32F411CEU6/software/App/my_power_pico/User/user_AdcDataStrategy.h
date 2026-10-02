@@ -218,82 +218,6 @@ typedef struct
 #define AUTO_RANGE_SKIP_CHUNKS          1U
 #define AUTO_RANGE_COOLDOWN_CHUNKS      5U
 
-/**
- * @brief 自动量程观察状态
- * @note  这些状态只用于LCD调试显示，真正换挡仍由计数器和标志控制。
- * 正常情况：
-HOLD
- → UP_WAIT / DOWN_WAIT
- → SWITCH
- → SKIP
- → COOL
- → HOLD
- */
-typedef enum
-{
-    ADC_RANGE_STATE_HOLD = 0,       //保持当前档位，没有满足切档条件。
-    ADC_RANGE_STATE_UP_WAIT,        //达到升档阈值，正在连续确认，例如 U2/4。
-    ADC_RANGE_STATE_DOWN_WAIT,      //达到降档阈值，正在连续确认，例如 D6/10。
-    ADC_RANGE_STATE_SWITCH,         //确认完成，本次真正执行档位切换。
-    ADC_RANGE_STATE_SKIP,           //切档后的下一整个 ADC 数据块作废，避免模拟开关、运放等切换瞬态产生的脏数据影响判断。
-    ADC_RANGE_STATE_COOL            //切档后的冷却期。ADC 数据可以继续使用，但暂时禁止再次换挡，防止档位来回抖动。
-} ADC_AutoRangeState_T;
-
-
-/**
- * @brief 最近一次换挡原因
- */
-typedef enum
-{
-    ADC_SWITCH_REASON_NONE = 0,         //无切档原因，正常保持当前档位
-    ADC_SWITCH_REASON_OVERLOAD,         //当前档位电流太大，比如LOW到MID，MID到HIGH
-    ADC_SWITCH_REASON_UNDERLOAD,        //相反
-    ADC_SWITCH_REASON_NEAR_RAIL,        //ADC值接近ADC的上下限时（0为下，4095为上），比如当前采样电阻ADC=4090,而最大是4095，所以要逼近了，换挡
-    ADC_SWITCH_REASON_RANGE_ERROR       //防止某个BUG出现导致切换到错误档位，可以记录
-} ADC_SwitchReason_T;
-
-/**
- * @brief STEP5自动量程调试数据
- */
-typedef struct 
-{
-    bool valid;
-
-     /* 本数据对应的档位，以及当前真实硬件档位。 */
-    uint8_t sample_range;           //记录某一次的ADC值是在什么档位采集的
-    uint8_t current_range;          //记录当前档位
-    uint8_t request_range;          //记录自动切换期望的档位
-
-
-    /* 当前使用的原始ADC数据。 */
-    uint16_t current_adc_raw;       //记录当前量程对应的ADC原始值
-    uint16_t ref_adc_raw;           //VREF基准ADC值
-    int32_t delta_adc_raw;          //ADC值与VREF基准的ADC差值，即ADC变化值
-    uint16_t abs_delta_adc_raw;     //ADC变化值取绝对值
-
-    /* 自动换挡内部状态。 */
-    ADC_AutoRangeState_T state;     //记录当前自动量程状态机处于什么状态
-    uint8_t up_count;               //记录升档条件达标了几次
-    uint8_t down_count;             //记录降档条件达标了几次
-    uint8_t skip_chunks;            //切换档位后，由于可能下1ms来的ADC数据，是上一个档位测量得到的，所以丢弃
-    uint8_t cooldown_chunks;        //切换档位后，至少要经过几次的ADC值后，才恢复自动切档判断，目的是为了数据的稳定性
-
-    /* 专门用于记录上一次切档的具体情况，方便调试对比用。 */
-    uint8_t last_from;              //记录从哪个档位切换
-    uint8_t last_to;                //记录切到哪个档位
-    uint8_t last_confirm_count;     //记录条件达标的次数
-    ADC_SwitchReason_T last_reason; //标记上次为什么切档的原因
-
-    /* 累计统计，防止LCD刷新慢而漏看短暂状态。 */
-    uint32_t switch_count;
-    uint32_t skipped_block_count;       //累计丢弃过多少个 ADC block。比如：发生2次切档，那么就为2
-    uint32_t cooldown_block_count;      //累计从开机到现在累计经历了多少个 cooldown block。如果发生两次切档，每次 COOL 5 block：即10
-    uint32_t lost_block_count;          //队列满、ADC错误或档位已变化时，累计丢弃的数据块数量
-
-
-}ADC_AutoRangeDebug_T;
-
-
 /*
  * ADC采样率为10kHz。
  * LCD每250ms更新一次平均值，对应约2500个采样点。
@@ -317,19 +241,6 @@ bool Data_Monitor_GetValues(float *out_voltage_v,
 
 
 
-/**
- * @brief 一个DMA半区的五通道平均原始值
- */
-typedef struct 
-{
-    uint16_t vol_raw;
-    uint16_t low_raw;
-    uint16_t mid_raw;
-    uint16_t high_raw;
-    uint16_t ref_raw;
-}ADC_RawAverage_T;
-
-
 /*
  * DMA原始采样缓冲区：
  * 第0～9行是前半区；
@@ -338,11 +249,6 @@ typedef struct
  */
 extern uint16_t adc_raw_buffer[ADC_DMA_ROWS][ADC_CHANNELS];
 
-/* 临时变量：调试计数器，可在Keil Watch窗口中观察。 */
-extern volatile uint32_t adc_half_count;
-extern volatile uint32_t adc_full_count;
-extern volatile uint32_t adc_error_count;
-
 /**
  * @brief 启动ADC定时触发和DMA循环采样
  * @return HAL_OK 启动成功
@@ -350,21 +256,6 @@ extern volatile uint32_t adc_error_count;
  */
 HAL_StatusTypeDef ADC_Sampling_Start(void);
 void ADC_Sampling_Stop(void);
-
-/**
- * @brief 获取最近一个完整DMA半区的五通道平均值
- * @param average 用于保存平均结果
- * @return true 已经取得有效采样
- * @return false ADC还没有完成第一个半区
- */
-bool ADC_GetRawAverage(ADC_RawAverage_T *average);
-
-/**
- * @brief 把电压通道VADC值换算成VBUS电压
- * @param vol_raw 电压通道平均原始值
- * @return VBUS电压，单位V
- */
-float ADC_ConvertVoltage_V(uint16_t vol_raw);
 
 /**
  * @brief 将ADC原始值换算成经过校准后的电流
@@ -439,16 +330,6 @@ bool Process_ADC_Chunk(const uint16_t *chunk_ptr);
  * @note 只能由ADC处理任务调用，不能在中断或LCD任务中调用
  */
 uint32_t ADC_ProcessPendingBlocks(void);
-
-/**
- * @brief 获取STEP5自动量程调试数据
- * @param debug 用于保存调试数据
- * @return true 已经有有效数据
- * @return false 参数错误或ADC尚未产生数据
- */
-bool ADC_AutoRange_GetDebug(ADC_AutoRangeDebug_T *debug);
-
-
 
 /**
  * @brief 填入默认校准参数

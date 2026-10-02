@@ -128,11 +128,6 @@ void User_Tasks_Init(void);
 UserTasksStatus_T User_Tasks_GetStatus(void);
 
 /**
- * @brief 获取创建失败位图
- */
-uint32_t User_Tasks_GetErrorMask(void);
-
-/**
  * @brief 标记一次性HardwareInitTask已经运行
  * @note 只给HardwareInitTask调用
  */
