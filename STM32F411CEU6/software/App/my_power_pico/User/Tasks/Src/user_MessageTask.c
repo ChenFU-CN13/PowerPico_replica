@@ -28,10 +28,10 @@
   *
   *   发送仲裁（MsgSendTask 内，单USB通道排队发送）：
   *     命令帧优先于 ADC 数据帧，靠 pending_command / pending_adc /
-  *     active_tx 三缓冲 + tx_active 状态避免两路数据互相覆盖。
+  *     active_tx 三缓冲 + usb_tx_active 状态避免两路数据互相覆盖。
   *
   * 【依赖关系】
-  *   - user_AdcDataStrategy.h : ADC_ProcessPendingBlocks / ADC数据快照
+  *   - user_AdcDataStrategy.h : ADC_ProcessPendingBlocks / 最新ADC波形包
   *   - user_CmdStrategy.h     : CmdStrategy_Init / CmdStrategy_ProcessRx
   *   - usbd_cdc_if.h          : CDC_Transmit_FS(USB发送)
   *   - user_TasksInit.h       : 消息队列与事件标志定义
@@ -39,9 +39,7 @@
   * 【相关事件标志】(定义见 user_TasksInit.h)
   *   ADC_FLAG_BLOCK_READY ：有新的DMA半区或全区数据块待处理
   *   ADC_FLAG_ERROR       ：ADC发生错误
-  
-  注意以上是源码的注释，现在是用来临时测试用的！！，后续工程完成后，继续沿用以上相关注释
-  ******************************************************************************
+ ******************************************************************************
   */
 #include "user_MessageTask.h"
 #include "user_TasksInit.h"
@@ -61,17 +59,38 @@
  * LCD每200ms刷新一次，PowerDataQueue深度为8，
  * 这个速度既能及时响应负载变化，也不会频繁刷新屏幕。
  */
-#define STEP6D_UI_PUBLISH_BLOCKS    100U
+#define MESSAGE_UI_PUBLISH_BLOCKS    100U
 
 /*
  * 10：先进行低速测试，每10个ADC块上传一包，约100包/秒。
  * 1 ：最终全速测试，每个ADC块上传一包，约1000包/秒。
  */
-#define STEP7_WAVE_PACKET_DIV       1U
+#define MESSAGE_WAVE_PACKET_DIV       1U
 
-#if (STEP7_WAVE_PACKET_DIV == 0U)
-#error "STEP7_WAVE_PACKET_DIV must be greater than zero"
+#if (MESSAGE_WAVE_PACKET_DIV == 0U)
+#error "MESSAGE_WAVE_PACKET_DIV must be greater than zero"
 #endif
+
+/**
+ * @brief MessageSendTask循环中需要长期保存的状态
+ *
+ * pending_command和pending_adc保存两类待发送数据。
+ * active_tx是USB驱动真正使用的独立缓冲区，发送完成前不能覆盖。
+ */
+typedef struct
+{
+    uint32_t ui_block_count;
+    uint32_t wave_div_count;
+    uint32_t last_wave_sequence;
+
+    CmdTxFrame_T pending_command;
+    USB_ADC_Packet_T pending_adc;
+    uint8_t active_tx[sizeof(USB_ADC_Packet_T)];
+
+    bool command_pending;
+    bool adc_pending;
+    bool usb_tx_active;
+} MessageSendContext_T;
 
 
 /* Tasks ---------------------------------------------------------------------*/
@@ -198,7 +217,7 @@ void MessageReceiveTask(void *argument)
  * 电压和电流都来自约250ms的统计窗口。
  * USB波形上传仍然保持原来的原始采样数据，不受本函数影响。
  */
-static void Step6D_PublishPowerData(void)
+static void MessageSend_PublishPowerData(void)
 {
 
     PowerData_T new_data = {0};
@@ -243,6 +262,174 @@ static void Step6D_PublishPowerData(void)
 }
 
 /**
+ * @brief 处理ADC事件，并更新LCD发布节拍和待发送波形
+ * @param context MessageSendTask私有状态
+ * @param flags 本轮收到的任务事件标志
+ */
+static void MessageSend_HandleAdcEvents(MessageSendContext_T *context,
+                                        uint32_t flags)
+{
+    uint32_t processed_count = 0U;
+    uint32_t latest_wave_sequence;
+    uint32_t new_wave_count;
+
+    if ((flags & ADC_FLAG_ALL_EVENTS) != 0U)
+    {
+        processed_count = ADC_ProcessPendingBlocks();
+    }
+
+    /* 保留原来的LCD数据发布节拍。 */
+    context->ui_block_count += processed_count;
+
+    if (context->ui_block_count >= MESSAGE_UI_PUBLISH_BLOCKS)
+    {
+        context->ui_block_count %= MESSAGE_UI_PUBLISH_BLOCKS;
+        MessageSend_PublishPowerData();
+    }
+
+    if (processed_count == 0U
+        || !ADC_GetLatestUsbPacket(NULL,
+                                   &latest_wave_sequence))
+    {
+        return;
+    }
+
+    /* 序号差表示本轮至少产生了一包新数据。 */
+    new_wave_count =
+        latest_wave_sequence - context->last_wave_sequence;
+
+    if (new_wave_count == 0U)
+    {
+        return;
+    }
+
+    context->last_wave_sequence = latest_wave_sequence;
+    context->wave_div_count += new_wave_count;
+
+    if (context->wave_div_count < MESSAGE_WAVE_PACKET_DIV)
+    {
+        return;
+    }
+
+    context->wave_div_count %= MESSAGE_WAVE_PACKET_DIV;
+
+    /*
+     * pending_adc还没有发出时又有新包，直接用最新包覆盖旧包。
+     * 波形属于实时数据，优先保证“新”，不积压历史波形。
+     */
+    if (ADC_GetLatestUsbPacket(&context->pending_adc, NULL))
+    {
+        context->adc_pending = true;
+    }
+}
+
+/**
+ * @brief 在命令缓存空闲时，从回复队列取出一帧命令
+ * @param context MessageSendTask私有状态
+ */
+static void MessageSend_LoadPendingCommand(MessageSendContext_T *context)
+{
+    if (context->command_pending || CmdTxQueue == NULL)
+    {
+        return;
+    }
+
+    if (osMessageQueueGet(CmdTxQueue,
+                          &context->pending_command,
+                          NULL,
+                          0U) != osOK)
+    {
+        return;
+    }
+
+    /* 非法帧直接丢弃，避免发送任务被一帧坏数据长期卡住。 */
+    if (context->pending_command.length == 0U
+        || context->pending_command.length
+               > sizeof(context->pending_command.data))
+    {
+        return;
+    }
+
+    context->command_pending = true;
+}
+
+/**
+ * @brief USB空闲时尝试发送一帧命令或波形
+ * @param context MessageSendTask私有状态
+ *
+ * 命令回复优先于波形。CDC_Transmit_FS()返回非USBD_OK时，
+ * 本轮没有取得缓冲区所有权，pending数据保留到下一轮重试。
+ */
+static void MessageSend_TryTransmit(MessageSendContext_T *context)
+{
+    const uint8_t *next_data = NULL;
+    uint16_t next_length = 0U;
+    bool next_is_command = false;
+    uint8_t usb_tx_result;
+
+    if (context->usb_tx_active)
+    {
+        return;
+    }
+
+    if (context->command_pending)
+    {
+        next_data = context->pending_command.data;
+        next_length = context->pending_command.length;
+        next_is_command = true;
+    }
+    else if (context->adc_pending)
+    {
+        next_data = (const uint8_t *)&context->pending_adc;
+        next_length = sizeof(context->pending_adc);
+    }
+
+    if (next_data == NULL)
+    {
+        return;
+    }
+
+    if (next_length > sizeof(context->active_tx))
+    {
+        if (next_is_command)
+        {
+            context->command_pending = false;
+        }
+        else
+        {
+            context->adc_pending = false;
+        }
+
+        return;
+    }
+
+    /* USB驱动发送期间会继续使用该地址，必须复制到独立缓冲区。 */
+    memcpy(context->active_tx, next_data, next_length);
+
+    /* 先置忙，再调用驱动，避免极快的完成回调覆盖状态。 */
+    context->usb_tx_active = true;
+    usb_tx_result =
+        CDC_Transmit_FS(context->active_tx, next_length);
+
+    if (usb_tx_result == USBD_OK)
+    {
+        if (next_is_command)
+        {
+            context->command_pending = false;
+        }
+        else
+        {
+            context->adc_pending = false;
+        }
+    }
+    else
+    {
+        /* USBD_BUSY或发送失败时保留pending数据，1ms后重试。 */
+        context->usb_tx_active = false;
+    }
+}
+
+/**
  * @brief 处理ADC数据、发布LCD数据并统一发送波形包和命令回复
  * @param argument FreeRTOS任务入口参数，本任务没有使用
  *
@@ -257,56 +444,26 @@ static void Step6D_PublishPowerData(void)
  */
 void MessageSendTask(void *argument)
 {
-    uint32_t flags;                 //等待的事件标志位
-    uint32_t wait_time;             //等待时间，单位ms
-    uint32_t processed_count;       //本次处理的数据块数量
-    uint32_t ui_block_count = 0U;   //累计处理的数据块数量
-
-    uint32_t wave_div_count = 0U;      //波形包发送次数
-    uint32_t last_wave_sequence = 0U;  //上一个波形包序号
-    uint32_t latest_wave_sequence;     //最新波形包序号
-    uint32_t new_wave_count;           //新波形包数量
-
-    CmdTxFrame_T pending_command;     //待发送的命令回复
-    USB_ADC_Packet_T pending_adc;     //待发送的ADC波形包
-
-    /*
-     * active_tx必须能够容纳最大的波形包。
-     * 命令回复最大58字节，小于81字节。
-     */
-    uint8_t active_tx[sizeof(USB_ADC_Packet_T)];
-
-    const uint8_t *next_data;       //待发送的数据指针
-    uint16_t next_length;          //待发送的数据长度
-
-    bool command_pending = false;  //是否有待发送的命令回复
-    bool adc_pending = false;       //是否有待发送的ADC波形包
-    bool usb_tx_active = false;     //USB发送是否正在处理
-    bool next_is_command;          //下一个待发送数据是否为命令回复
-
-    uint8_t usb_tx_result;          //USB发送结果
+    uint32_t flags;
+    uint32_t wait_time;
+    MessageSendContext_T context = {0};
 
     (void)argument;
 
     for (;;)
     {
-        /*1.
+        /*
          * USB空闲且有待发数据时，每1ms重试一次。
          * USB发送中时，等待发送完成、ADC或命令事件。
          */
         wait_time =
-            (!usb_tx_active                     //USB发送是否正在处理
-             && (command_pending || adc_pending))//是否有待发送的命令回复或ADC波形包
+            (!context.usb_tx_active
+             && (context.command_pending
+                 || context.adc_pending))
             ? 1U
             : osWaitForever;
 
-
-        /*2.
-        这里等待的事件标志位是：
-         * 1. ADC_FLAG_ALL_EVENTS：ADC模块产生的数据块
-         * 2. FLAG_CMD_TX_READY：CmdTxQueue取出的命令回复
-         * 3. FLAG_USB_TX_COMPLETE：USB发送完成
-        */
+        /* 同时等待ADC数据、命令回复和USB发送完成事件。 */
         flags = osThreadFlagsWait(
             ADC_FLAG_ALL_EVENTS
                 | FLAG_CMD_TX_READY
@@ -314,201 +471,19 @@ void MessageSendTask(void *argument)
             osFlagsWaitAny,
             wait_time);
 
-        /*3.
-         * 1ms等待超时不是故障。
-         * 清成0后继续尝试发送pending数据。
-         */
+        /* 1ms等待超时不是故障，继续重试pending数据。 */
         if ((flags & osFlagsError) != 0U)
         {
-            /*osFlagsError：等待超时不是故障*/
             flags = 0U;
         }
 
         if ((flags & FLAG_USB_TX_COMPLETE) != 0U)
         {
-            /*FLAG_USB_TX_COMPLETE：USB发送完成*/
-            usb_tx_active = false;
+            context.usb_tx_active = false;
         }
 
-        /*执行到这里说明程序等待超时不是故障，或者USB发送完成，那么准备处理数据块
-        processed_count = 0 是为了清空上次处理的数据块数量，避免重复处理*/
-        processed_count = 0U;//本次处理的数据块数量
-
-        if ((flags & ADC_FLAG_ALL_EVENTS) != 0U)
-        {
-            /*ADC_FLAG_ALL_EVENTS：ADC模块产生的数据块*/
-            processed_count =
-                ADC_ProcessPendingBlocks();//处理ADC模块产生的数据块
-        }
-
-        /* 保留原来的LCD数据发布节拍。 */
-        ui_block_count += processed_count;
-
-        /*这里用大白话讲一下：
-        1. ui_block_count 是累计处理的数据块数量，每次处理ADC模块产生的数据块后，会更新这个值。
-        2. STEP6D_UI_PUBLISH_BLOCKS 是LCD数据发布节拍，每处理STEP6D_UI_PUBLISH_BLOCKS个数据块，就会发布一次LCD数据。
-        3. 这里用取余运算 % 来实现循环发布，避免数据丢失。*/
-        if (ui_block_count
-            >= STEP6D_UI_PUBLISH_BLOCKS)
-        {
-            ui_block_count %=
-                STEP6D_UI_PUBLISH_BLOCKS;
-
-            Step6D_PublishPowerData();//发布最新测量结果给LCD任务
-        }
-
-        /*
-         * 获取ADC模块最近生成的波形包序号。
-         * 序号发生变化，说明至少产生了一包新数据。
-         */
-        if (processed_count != 0U
-            && ADC_GetLatestUsbPacket(
-                   NULL,
-                   &latest_wave_sequence))
-        {
-            new_wave_count =
-                latest_wave_sequence
-                - last_wave_sequence;
-
-            if (new_wave_count != 0U)
-            {
-                last_wave_sequence =
-                    latest_wave_sequence;
-
-                wave_div_count +=
-                    new_wave_count;
-
-                if (wave_div_count
-                    >= STEP7_WAVE_PACKET_DIV)
-                {
-                    wave_div_count %=
-                        STEP7_WAVE_PACKET_DIV;
-
-                    /*
-                     * pending_adc还没有发出时又有新包，
-                     * 直接使用最新包覆盖旧包。
-                     * 实时波形优先保证“新”，旧数据不继续积压。
-                     */
-                    if (ADC_GetLatestUsbPacket(
-                            &pending_adc,
-                            NULL))
-                    {
-                        adc_pending = true;
-                    }
-                }
-            }
-        }
-
-        /*
-         * 命令缓存空闲时，从命令回复队列取出一帧。
-         */
-        if (!command_pending
-            && CmdTxQueue != NULL
-            && osMessageQueueGet(
-                   CmdTxQueue,
-                   &pending_command,
-                   NULL,
-                   0U) == osOK)
-        {
-            command_pending = true;
-        }
-
-        /*
-         * 清理非法命令帧，避免一直卡住发送任务。
-         */
-        if (command_pending
-            && (pending_command.length == 0U
-                || pending_command.length
-                       > sizeof(pending_command.data)))
-        {
-            command_pending = false;
-        }
-
-        /*
-         * 上一帧还没有完成时，
-         * active_tx绝对不能覆盖。
-         */
-        if (usb_tx_active)
-        {
-            continue;
-        }
-
-        next_data = NULL;
-        next_length = 0U;
-        next_is_command = false;
-
-        /*
-         * 命令回复优先。
-         * 波形是连续数据，晚一包影响不大；
-         * 命令需要尽快返回，避免上位机超时。
-         */
-        if (command_pending)
-        {
-            next_data = pending_command.data;
-            next_length = pending_command.length;
-            next_is_command = true;
-        }
-        else if (adc_pending)
-        {
-            next_data = (const uint8_t *)&pending_adc;
-            next_length = sizeof(pending_adc);
-        }
-
-        if (next_data == NULL)
-        {
-            continue;
-        }
-
-        if (next_length > sizeof(active_tx))
-        {
-            if (next_is_command)
-            {
-                command_pending = false;
-            }
-            else
-            {
-                adc_pending = false;
-            }
-
-            continue;
-        }
-
-        /*
-         * USB驱动发送期间会继续使用这个地址，
-         * 所以必须复制到独立的active_tx。
-         */
-        memcpy(active_tx,
-               next_data,
-               next_length);
-
-        /*
-         * 必须在CDC_Transmit_FS之前置true，
-         * 防止发送完成回调来得很快造成状态覆盖。
-         */
-        usb_tx_active = true;
-
-        usb_tx_result =
-            CDC_Transmit_FS(active_tx,
-                            next_length);
-
-        if (usb_tx_result == USBD_OK)
-        {
-            if (next_is_command)
-            {
-                command_pending = false;
-            }
-            else
-            {
-                adc_pending = false;
-            }
-        }
-        else
-        {
-            /*
-             * 本轮没有启动发送。
-             * 保留pending数据，1ms后继续重试。
-             */
-            usb_tx_active = false;
-        }
+        MessageSend_HandleAdcEvents(&context, flags);
+        MessageSend_LoadPendingCommand(&context);
+        MessageSend_TryTransmit(&context);
     }
 }
