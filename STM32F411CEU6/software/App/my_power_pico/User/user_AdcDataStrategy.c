@@ -289,20 +289,6 @@ static bool ADC_Calibration_RangeIsValid(
         (hardware_scale_ua_per_lsb * multiplier);
 
     /*
-     * isfinite()用于排除NaN和正负无穷。
-     *
-     * 同时把倍率限制在理论值的75%~125%，
-     * 避免EEPROM损坏后产生极端显示值。
-     */
-    if (!isfinite(multiplier)
-        || !isfinite(offset_ua)
-        || multiplier < 0.75f
-        || multiplier > 1.25f)
-    {
-        return false;
-    }
-
-    /*
      * 三档统一限制在正负32个ADC码以内。
      * 这样虽然三档允许的uA偏移不同，
      * 但对应的硬件零点偏差范围相同。
@@ -455,6 +441,156 @@ bool Data_Monitor_GetValues(float *out_voltage_v,
 
 
 /********************************自动切换量程核心代码****************************************/
+
+/**
+ * @brief 判断LOW档是否需要升到MID档
+ * @param abs_delta_adc_raw 电流通道与参考通道的ADC绝对差值
+ * @return 继续保持LOW档，或者请求切换到MID档
+ */
+static uint8_t ADC_AutoRange_CheckLow(uint16_t abs_delta_adc_raw)
+{
+    /* LOW已经是最小电流档，不存在继续降档。 */
+    s_auto_down_count = 0U;
+
+    if (abs_delta_adc_raw >= AUTO_RANGE_LOW_UP_CODE)
+    {
+        if (s_auto_up_count < AUTO_RANGE_UP_CONFIRM_TIMES)
+        {
+            s_auto_up_count++;
+        }
+
+        if (s_auto_up_count >= AUTO_RANGE_UP_CONFIRM_TIMES)
+        {
+            return MID_CUR;
+        }
+    }
+    else
+    {
+        /* 中途一个采样点不满足条件，连续确认必须重新开始。 */
+        s_auto_up_count = 0U;
+    }
+
+    return LOW_CUR;
+}
+
+/**
+ * @brief 判断MID档需要升档、降档还是保持
+ * @param current_adc_raw MID电流通道的原始ADC值
+ * @param abs_delta_adc_raw 电流通道与参考通道的ADC绝对差值
+ * @return LOW、MID或HIGH目标档位
+ */
+static uint8_t ADC_AutoRange_CheckMid(uint16_t current_adc_raw,
+                                      uint16_t abs_delta_adc_raw)
+{
+    bool mid_near_rail;
+
+    /*
+     * MID通道接近0或4095时，即使差值判断异常，
+     * 也优先按过载处理，避免ADC饱和后继续停在MID档。
+     */
+    mid_near_rail =
+        (current_adc_raw <= AUTO_RANGE_MID_RAIL_MARGIN)
+        || (current_adc_raw >=
+            (4095U - AUTO_RANGE_MID_RAIL_MARGIN));
+
+    /* 升档优先，升档和降档两个计数器不能同时累加。 */
+    if ((abs_delta_adc_raw >= AUTO_RANGE_MID_UP_CODE)
+        || mid_near_rail)
+    {
+        s_auto_down_count = 0U;
+
+        if (s_auto_up_count < AUTO_RANGE_UP_CONFIRM_TIMES)
+        {
+            s_auto_up_count++;
+        }
+
+        if (s_auto_up_count >= AUTO_RANGE_UP_CONFIRM_TIMES)
+        {
+            return HIGH_CUR;
+        }
+    }
+    else if (abs_delta_adc_raw <= AUTO_RANGE_MID_DOWN_CODE)
+    {
+        s_auto_up_count = 0U;
+
+        if (s_auto_down_count < AUTO_RANGE_DOWN_CONFIRM_TIMES)
+        {
+            s_auto_down_count++;
+        }
+
+        if (s_auto_down_count >= AUTO_RANGE_DOWN_CONFIRM_TIMES)
+        {
+            return LOW_CUR;
+        }
+    }
+    else
+    {
+        /* 当前幅度位于上下阈值之间，处于保持区。 */
+        ADC_AutoRange_ClearConfirmCount();
+    }
+
+    return MID_CUR;
+}
+
+/**
+ * @brief 判断HIGH档是否需要降到MID档
+ * @param abs_delta_adc_raw 电流通道与参考通道的ADC绝对差值
+ * @return 继续保持HIGH档，或者请求切换到MID档
+ */
+static uint8_t ADC_AutoRange_CheckHigh(uint16_t abs_delta_adc_raw)
+{
+    /* HIGH已经是最大电流档，不存在继续升档。 */
+    s_auto_up_count = 0U;
+
+    if (abs_delta_adc_raw <= AUTO_RANGE_HIGH_DOWN_CODE)
+    {
+        if (s_auto_down_count < AUTO_RANGE_DOWN_CONFIRM_TIMES)
+        {
+            s_auto_down_count++;
+        }
+
+        if (s_auto_down_count >= AUTO_RANGE_DOWN_CONFIRM_TIMES)
+        {
+            return MID_CUR;
+        }
+    }
+    else
+    {
+        s_auto_down_count = 0U;
+    }
+
+    return HIGH_CUR;
+}
+
+/**
+ * @brief 根据当前真实档位执行一次自动量程判断
+ * @param current_range 当前真实硬件档位
+ * @param current_adc_raw 当前档位对应的电流ADC值
+ * @param abs_delta_adc_raw 电流通道与参考通道的ADC绝对差值
+ * @return 本采样点判断出的目标档位
+ */
+static uint8_t ADC_AutoRange_DecideRange(uint8_t current_range,
+                                         uint16_t current_adc_raw,
+                                         uint16_t abs_delta_adc_raw)
+{
+    switch (current_range)
+    {
+        case LOW_CUR:
+            return ADC_AutoRange_CheckLow(abs_delta_adc_raw);
+
+        case MID_CUR:
+            return ADC_AutoRange_CheckMid(current_adc_raw,
+                                          abs_delta_adc_raw);
+
+        case HIGH_CUR:
+            return ADC_AutoRange_CheckHigh(abs_delta_adc_raw);
+
+        default:
+            /* 未知负载优先回到最大量程，避免大电流经过50Ω采样电阻。 */
+            return HIGH_CUR;
+    }
+}
+
 /**
  * @brief 处理一个DMA半区，并执行自动量程判断
  * @param chunk_ptr DMA半区首地址，包含10组五通道ADC数据
@@ -472,7 +608,6 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
     uint16_t current_adc_raw;   //当前通道原始ADC值
     uint16_t ref_adc_raw;       //参考通道原始ADC值
     uint16_t abs_delta_adc_raw; //绝对差值
-    bool mid_near_rail;         //是否在中档位附近
 
     if (chunk_ptr == NULL)
     {
@@ -565,156 +700,10 @@ bool Process_ADC_Chunk(const uint16_t* chunk_ptr)
 
 
 
-    switch (current_range)
-    {
-             case LOW_CUR:
-            {
-                /*
-                 * LOW已经是最小电流档，只能升到MID。
-                 * 所以这里清除无意义的降档计数。
-                 */
-                s_auto_down_count = 0U;
-
-                if (abs_delta_adc_raw >= AUTO_RANGE_LOW_UP_CODE)
-                {   /*如果大于阈值，则判断已经是否满足4次升档条件计数*/
-                    if (s_auto_up_count < AUTO_RANGE_UP_CONFIRM_TIMES)
-                    {   
-                        s_auto_up_count++;
-                    }
-
-                    if (s_auto_up_count >= AUTO_RANGE_UP_CONFIRM_TIMES)
-                    {   /*如果计数条件已经满足，则准备升档*/
-                        request_range = MID_CUR;                //标记期望升档的档位  
-                    }
-                }
-                else
-                {
-                    /*
-                     * 只要中途有一个采样点不满足条件，
-                     * 连续确认链条就要清零，重新开始计数。
-                     */
-                    s_auto_up_count = 0U;
-                }
-
-                break;
-            }
-
-            case MID_CUR:
-            {
-                /*
-                 * MID档既能升到HIGH，也能降到LOW。
-                 *
-                 * 如果MID通道已经接近0或4095，即使DELTA判断异常，
-                 * 也优先按过载处理，避免ADC饱和后继续停在MID档。
-                 */
-                mid_near_rail =
-                    (current_adc_raw <= AUTO_RANGE_MID_RAIL_MARGIN)
-                    || (current_adc_raw >=
-                        (4095U - AUTO_RANGE_MID_RAIL_MARGIN));
-
-                /*
-                 * 升档和降档必须互斥。
-                 * 优先处理过载，防止极端情况下同时增加两个计数器。(也就是先处理升档)
-                 */
-                if ((abs_delta_adc_raw >= AUTO_RANGE_MID_UP_CODE)
-                    || mid_near_rail)
-                {
-                    /*如果变化量大于阈值*/
-                    s_auto_down_count=0;    //避免两个计算器同时增加，先停止降档计
-
-                    if (s_auto_up_count < AUTO_RANGE_UP_CONFIRM_TIMES)
-                    {
-                         s_auto_up_count++; //小于条件则继续++
-                    }
-                    if (s_auto_up_count>=AUTO_RANGE_UP_CONFIRM_TIMES)
-                    {
-                        /*如果满足升档条件*/
-                        request_range = HIGH_CUR;//标记期望升档档位
-                    }
-                    
-                }
-                /*后处理降档逻辑*/
-                else if (abs_delta_adc_raw <= AUTO_RANGE_MID_DOWN_CODE)
-                {
-                    /*如果变化量小于阈值*/
-                    /*为避免两个计数器同时计数，先停止升档计数*/
-                    s_auto_up_count = 0;
-
-                    if (s_auto_down_count < AUTO_RANGE_DOWN_CONFIRM_TIMES)
-                    {   /*如果降档条件＜10*/
-                        s_auto_down_count++;//继续++
-                    }
-                    
-                    if (s_auto_down_count >= AUTO_RANGE_DOWN_CONFIRM_TIMES)
-                    {
-                        /* 如果降档计数达到，那么标记期望切档模式 */
-                        request_range = LOW_CUR;
-                    }
-                    
-
-
-
-                }
-                else
-                {
-                    /*
-                     * 当前幅度位于上下阈值之间。
-                     * 那么就停在保持区，不升档也不降档。
-                     */
-                    ADC_AutoRange_ClearConfirmCount();
-                }
-
-
-
-
-
-
-                break;
-            }
-
-
-            case HIGH_CUR:
-            {
-                /*
-                 * HIGH已经是最大电流档，只能降到MID。
-                 */
-                s_auto_up_count = 0U;//所以升档的计数必须停
-
-                if (abs_delta_adc_raw <= AUTO_RANGE_HIGH_DOWN_CODE)
-                {
-                    /*如果降档计数器＜10，则继续++*/
-                    if (s_auto_down_count <
-                        AUTO_RANGE_DOWN_CONFIRM_TIMES)
-                    {
-                        s_auto_down_count++;
-                    }
-
-                    /*如果降档次数达标，则标记期望切档档位，并标记切档原因是负载电流减小，切换高精度单位测量*/
-                    if (s_auto_down_count >=AUTO_RANGE_DOWN_CONFIRM_TIMES)
-                    {
-                        request_range = MID_CUR;
-                    }
-                }
-                else
-                {
-                    /*如果中途出现电流ADC值小于降档阈值，则取消连续计数并归0，状态标记为保持*/
-                    s_auto_down_count = 0U;
-                }
-                
-
-                break;
-            }
-
-            default:
-            {
-                /*
-                 * 软件档位记录异常时，回到HIGH档。
-                 * 未知负载优先使用最大量程，避免大电流经过50Ω采样电阻。
-                 */
-                request_range = HIGH_CUR;
-                break;
-            }
-    }   /* switch (current_range) 换挡判断结束 */
+        request_range =
+            ADC_AutoRange_DecideRange(current_range,
+                                      current_adc_raw,
+                                      abs_delta_adc_raw);
 
         /*
          * 一旦确认需要换挡，就停止继续处理本块后面的采样点。
