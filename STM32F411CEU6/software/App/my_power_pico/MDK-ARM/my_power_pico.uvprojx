@@ -1567,11 +1567,6 @@
               <FileType>1</FileType>
               <FilePath>..\User\user_CmdStrategy.c</FilePath>
             </File>
-            <File>
-              <FileName>test.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\User\test.c</FilePath>
-            </File>
           </Files>
         </Group>
         <Group>
