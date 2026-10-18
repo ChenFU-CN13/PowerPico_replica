@@ -61,6 +61,12 @@ credentials.h
 # AI 对话记录 / 临时笔记
 AIchat.txt
 
+# 本地学习资料和过程文档，不作为公开仓库内容
+/DOC/
+
+# Keil/Arm Compiler 临时预处理文件
+*.__i
+
 # 文档渲染、审阅和一次性脚本产生的临时目录
 tmp/
 
