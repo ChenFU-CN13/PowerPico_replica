@@ -4,7 +4,7 @@
 
 本仓库是对 [No-Chicken/Power-Pico](https://github.com/No-Chicken/Power-Pico) 的学习复刻和工程化整理，不是从零原创的商业产品。硬件设计、官方界面、上位机协议和官方 BootLoader 方案归原作者所有；本仓库重点记录本人对 App 固件的分阶段复刻、问题定位、可靠性补强、代码清理和实机验证过程。
 
-> 当前状态：App 侧 STEP1～STEP10 已完成，阶段1～阶段8代码整理已完成并通过用户实机回归。独立 BootLoader（原计划STEP11）暂缓。
+
 
 ## 1. 项目功能
 
